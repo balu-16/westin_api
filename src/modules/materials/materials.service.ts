@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { DatabaseService } from '../../database/database.service';
 import { StorageService, BUCKETS } from '../storage/storage.service';
 import { CreateMaterialDto, FileType, MAX_FILE_BYTES, UpdateMaterialDto } from './dto';
+import { pageParams, paginatedEnvelope } from '../../common/util/pagination';
 
 type FileRow = {
   id: string;
@@ -45,11 +46,11 @@ export class MaterialsService {
   ) {}
 
   /**
-   * Library listing. `files` honors the search/subject filters; `folders` and
-   * `stats` always describe the whole collection so folder navigation stays
-   * stable while filtering.
+   * Library listing. `files` honors the search/subject filters with pagination;
+   * `folders` and `stats` always describe the whole collection so folder
+   * navigation stays stable while filtering. `pagination.total` is filtered.
    */
-  async list(search?: string, subjectId?: string) {
+  async list(search?: string, subjectId?: string, sort?: string, page?: string | number, pageSize?: string | number) {
     const where: string[] = [];
     const params: unknown[] = [];
     if (search && search.trim()) {
@@ -63,15 +64,50 @@ export class MaterialsService {
       where.push(`f.subject_id = $${params.length}::uuid`);
     }
 
-    const rows = await this.db.query<FileRow>(
-      `select ${FILE_COLUMNS}
+    const sortNorm = (sort ?? 'latest').toLowerCase();
+    let orderBy: string;
+    switch (sortNorm) {
+      case 'latest':
+        orderBy = `f.created_at desc, lower(f.name) asc, f.id asc`;
+        break;
+      case 'oldest':
+        orderBy = `f.created_at asc, lower(f.name) asc, f.id asc`;
+        break;
+      case 'name':
+        orderBy = `lower(f.name) asc, f.id asc`;
+        break;
+      case 'size':
+        orderBy = `f.size_bytes desc, lower(f.name) asc, f.id asc`;
+        break;
+      default:
+        throw new BadRequestException('sort must be one of latest, oldest, name, size');
+    }
+
+    // Enforce bounded pageSize (default 20, max 50 for materials per spec)
+    const rawPg = pageParams(page, pageSize);
+    const defaultSize = pageSize == null || String(pageSize).trim() === '' ? 20 : rawPg.pageSize;
+    const effPageSize = Math.min(defaultSize, 50);
+    const effPg = { ...rawPg, pageSize: effPageSize, limit: effPageSize, offset: (rawPg.page - 1) * effPageSize };
+    const limitIdx = params.length + 1;
+    const offsetIdx = params.length + 2;
+
+    const rows = await this.db.query<FileRow & { __total?: string | number }>(
+      `select ${FILE_COLUMNS}, count(*) over() as "__total"
          from study_files f
          ${FILE_JOINS}
         ${where.length ? `where ${where.join(' and ')}` : ''}
-        order by f.created_at desc, f.name asc`,
-      params,
+        order by ${orderBy}
+        limit $${limitIdx} offset $${offsetIdx}`,
+      [...params, effPg.limit, effPg.offset],
     );
-    const files = await Promise.all(rows.map((r) => this.mapFile(r)));
+    const mappedFiles = await Promise.all(
+      rows.map(async (r) => {
+        const { __total, ...rest } = r;
+        return { json: await this.mapFile(rest as FileRow), __total };
+      }),
+    );
+    const envelope = paginatedEnvelope(mappedFiles.map((m) => ({ ...m.json, __total: m.__total }) as any), effPg);
+    const files = envelope.rows;
 
     const folderRows = await this.db.query<{
       subject_id: string | null;
@@ -108,6 +144,12 @@ export class MaterialsService {
         totalFiles: Number(statsRow?.total_files ?? 0),
         totalSize: Number(statsRow?.total_size ?? 0),
         subjects: Number(statsRow?.subject_count ?? 0),
+      },
+      pagination: {
+        page: envelope.page,
+        pageSize: envelope.pageSize,
+        total: envelope.total,
+        totalPages: Math.max(1, Math.ceil(envelope.total / envelope.pageSize)),
       },
     };
   }

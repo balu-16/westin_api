@@ -27,11 +27,12 @@ export class AttendanceController {
   @Get('roster')
   @Roles('faculty')
   roster(
+    @CurrentUser() user: AuthUser,
     @Query('sectionId') sectionId: string,
     @Query('date') date: string,
     @Query('period') period: string,
   ) {
-    return this.attendance.roster(sectionId, date, period);
+    return this.attendance.roster(user.id, sectionId, date, period);
   }
 
   @Post('mark')

@@ -1,17 +1,34 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
 import { kolkataNow, monthEnd, monthShift, monthStart } from '../../common/util/time';
 
 const VALID_STATUSES = new Set(['present', 'absent', 'leave']);
+const VALID_PERIODS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 @Injectable()
 export class AttendanceService {
   constructor(private db: DatabaseService) {}
 
   /** Faculty-facing roster with any existing marks for the slot. */
-  async roster(sectionId: string, date: string, period: string) {
-    const section = await this.db.queryOne(`select id from sections where id = $1`, [sectionId]);
+  async roster(facultyId: string, sectionId: string, date: string, period: string) {
+    if (!sectionId || !isUuid(sectionId)) throw new BadRequestException('sectionId must be a UUID');
+    if (!DATE_RE.test(date) || isNaN(new Date(`${date}T00:00:00Z`).getTime())) throw new BadRequestException('date must be YYYY-MM-DD');
+    if (!VALID_PERIODS.has(period)) throw new BadRequestException('period must be one of h1..h6');
+
+    const section = await this.db.queryOne(`select id, label from sections where id = $1`, [sectionId]);
     if (!section) throw new NotFoundException('Section not found');
+
+    // Faculty must be assigned to this section (class teacher or timetable slot)
+    const assigned = await this.db.queryOne(
+      `select 1 from sections sec
+        where sec.id=$1 and (
+          sec.class_teacher_id=$2
+          or exists (select 1 from timetable_slots t where t.section_id=sec.id and t.faculty_id=$2)
+        )`,
+      [sectionId, facultyId],
+    );
+    if (!assigned) throw new NotFoundException('Section not found');
 
     const students = await this.db.query<any>(`
       select u.id, sp.student_id as "studentId", sp.roll_no as "rollNo", u.display_name as name
@@ -34,10 +51,16 @@ export class AttendanceService {
       rows.forEach((r) => (marks[r.student_id] = r.status));
     }
 
-    return { sessionExists: !!session, marks, students };
+    // Editable only on the class date (Asia/Kolkata) until midnight IST
+    const todayRow = await this.db.queryOne<{ today: string }>(`select (now() at time zone 'Asia/Kolkata')::date::text as today`);
+    const kolkataToday = todayRow?.today ?? kolkataNow().today;
+    const editable = date === kolkataToday;
+    const editableUntil = editable ? `${kolkataToday}T23:59:59+05:30` : null;
+
+    return { sessionExists: !!session, editable, editableUntil, marks, students };
   }
 
-  /** Bulk mark: upsert session + all records in one transaction. */
+  /** Bulk mark: upsert session + all records in one transaction. Editable only on class date midnight IST. */
   async mark(facultyId: string, dto: { sectionId: string; date: string; period: string; subjectId?: string; records: { studentId: string; status: string }[] }) {
     if (!Array.isArray(dto.records) || dto.records.length === 0) {
       throw new BadRequestException('records must not be empty');
@@ -47,8 +70,59 @@ export class AttendanceService {
         throw new BadRequestException(`Invalid status "${r.status}" (present|absent|leave)`);
       }
     }
+    if (!isUuid(dto.sectionId)) throw new BadRequestException('sectionId must be a UUID');
+    if (!DATE_RE.test(dto.date) || isNaN(new Date(`${dto.date}T00:00:00Z`).getTime())) throw new BadRequestException('date must be YYYY-MM-DD');
+    if (!VALID_PERIODS.has(dto.period)) throw new BadRequestException('period must be one of h1..h6');
+    if (dto.subjectId && !isUuid(dto.subjectId)) throw new BadRequestException('subjectId must be a UUID');
+    // duplicate student check
+    const seen = new Set<string>();
+    for (const r of dto.records) {
+      if (seen.has(r.studentId)) throw new BadRequestException(`Duplicate student ${r.studentId}`);
+      seen.add(r.studentId);
+    }
 
     return this.db.tx(async (client) => {
+      // Date cutoff — authoritative DB Asia/Kolkata date
+      const todayRow = await client.query<{ today: string }>(`select (now() at time zone 'Asia/Kolkata')::date::text as today`);
+      const today = todayRow.rows[0]?.today;
+      if (dto.date !== today) {
+        throw new UnprocessableEntityException({
+          code: 'ATTENDANCE_NOT_EDITABLE',
+          message: 'Attendance can be marked or edited only on the class date before midnight IST.',
+        });
+      }
+
+      // Section exists
+      const section = await client.query(`select id from sections where id=$1`, [dto.sectionId]);
+      if (section.rows.length === 0) throw new NotFoundException('Section not found');
+
+      // Faculty assigned to section?
+      const assigned = await client.query(
+        `select 1 from sections sec
+          where sec.id=$1 and (
+            sec.class_teacher_id=$2
+            or exists (select 1 from timetable_slots t where t.section_id=sec.id and t.faculty_id=$2)
+          )`,
+        [dto.sectionId, facultyId],
+      );
+      if (assigned.rows.length === 0) throw new NotFoundException('Section not found');
+
+      // Subject exists if provided
+      if (dto.subjectId) {
+        const subj = await client.query(`select id from subjects where id=$1`, [dto.subjectId]);
+        if (subj.rows.length === 0) throw new BadRequestException('Unknown subjectId');
+      }
+
+      // Every student must belong to this section
+      const studentIdsParam = dto.records.map((r) => r.studentId);
+      const belong = await client.query(
+        `select user_id from student_profiles where section_id=$1 and user_id = any($2::uuid[])`,
+        [dto.sectionId, studentIdsParam],
+      );
+      if (belong.rows.length !== dto.records.length) {
+        throw new BadRequestException('One or more students do not belong to this section');
+      }
+
       const session = await client.query(
         `insert into attendance_sessions (section_id, subject_id, session_date, period, marked_by)
          values ($1, $2, $3::date, $4, $5)
@@ -68,7 +142,6 @@ export class AttendanceService {
         statuses.push(r.status);
       }
 
-      // One multi-row upsert instead of N single-row statements.
       await client.query(
         `insert into attendance_records (session_id, student_id, status)
          select $1, u.sid, u.st
@@ -181,3 +254,6 @@ export class AttendanceService {
     };
   }
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isUuid(v: string): boolean { return UUID_RE.test(v); }

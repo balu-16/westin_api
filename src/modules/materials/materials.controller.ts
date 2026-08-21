@@ -11,8 +11,14 @@ export class MaterialsController {
 
   /** Library listing — any authenticated role. */
   @Get()
-  list(@Query('search') search?: string, @Query('subjectId') subjectId?: string) {
-    return this.materials.list(search, subjectId);
+  list(
+    @Query('search') search?: string,
+    @Query('subjectId') subjectId?: string,
+    @Query('sort') sort?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    return this.materials.list(search, subjectId, sort, page, pageSize);
   }
 
   /** Step 1 of the upload flow: get a path + signed PUT URL. */

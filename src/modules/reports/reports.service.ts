@@ -137,8 +137,9 @@ export class ReportsService {
     ]);
     if (!subject) throw new BadRequestException('Unknown subjectId');
 
-    const row = await this.db.queryOne<ReportRow>(
-      `with ins as (
+    try {
+      const row = await this.db.queryOne<ReportRow>(
+        `with ins as (
          insert into daily_reports (faculty_id, section_id, subject_id, report_date, topic, attachment_path)
          values ($1, $2, $3, $4, $5, $6)
          returning id, faculty_id, section_id, subject_id, report_date, topic, attachment_path, created_at
@@ -152,35 +153,35 @@ export class ReportsService {
          left join sections sec on sec.id = r.section_id
          left join subjects sub on sub.id = r.subject_id
          join users u on u.id = r.faculty_id`,
-      [
-        userId,
-        dto.sectionId,
-        dto.subjectId,
-        dto.reportDate,
-        dto.topic.trim(),
-        dto.attachmentPath?.trim() || null,
-      ],
-    );
-    return this.mapReport(row!);
+        [
+          userId,
+          dto.sectionId,
+          dto.subjectId,
+          dto.reportDate,
+          dto.topic.trim(),
+          dto.attachmentPath?.trim() || null,
+        ],
+      );
+      return this.mapReport(row!);
+    } catch (err: any) {
+      // Unique violation on (faculty_id, section_id, subject_id, report_date)
+      if (err.code === '23505' && (err.constraint === 'uq_daily_reports_occurrence' || String(err.message).includes('uq_daily_reports_occurrence'))) {
+        throw new BadRequestException({
+          code: 'REPORT_IMMUTABLE',
+          message: 'A report for this section/subject/date already exists and cannot be duplicated.',
+        });
+      }
+      throw err;
+    }
   }
 
-  /** Faculty may delete their own reports; admins may delete any. */
-  async remove(id: string, user: { id: string; role: 'student' | 'faculty' | 'admin' }) {
-    const row = await this.findOneRow(id);
-    if (user.role !== 'admin' && row.faculty_id !== user.id) {
-      throw new ForbiddenException('You can only delete your own reports');
-    }
-    await this.db.query(`delete from daily_reports where id = $1`, [id]);
-    if (row.attachment_path) {
-      try {
-        await this.storage.deleteObject(BUCKETS.reportAttachments, row.attachment_path);
-      } catch (err) {
-        this.logger.warn(
-          `storage delete failed for ${row.attachment_path}: ${(err as Error).message}`,
-        );
-      }
-    }
-    return { deleted: true };
+  /** Reports are immutable — no edit or delete after submission (DB trigger also enforces). */
+  async remove(id: string, _user: { id: string; role: 'student' | 'faculty' | 'admin' }) {
+    await this.findOneRow(id); // ensure 404 if not found
+    throw new BadRequestException({
+      code: 'REPORT_IMMUTABLE',
+      message: 'Reports cannot be deleted or edited after submission.',
+    });
   }
 
   private async findOneRow(id: string): Promise<ReportRow> {

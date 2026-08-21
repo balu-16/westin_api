@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query, HttpCode } from '@nestjs/common';
-import { IsArray, IsEmail, IsIn, IsInt, IsOptional, IsString, IsUUID } from 'class-validator';
+import { IsArray, IsEmail, IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AdminService } from './admin.service';
 
@@ -10,7 +10,7 @@ class CreateTeacherDto {
   @IsOptional() @IsString() designation?: string;
   @IsOptional() @IsString() department?: string;
   @IsOptional() @IsString() phone?: string;
-  @IsOptional() @IsArray() subjects?: string[];
+  @IsOptional() @IsArray() @IsUUID('4', { each: true }) subjects?: string[];
 }
 
 class UpdateTeacherDto {
@@ -20,7 +20,7 @@ class UpdateTeacherDto {
   @IsOptional() @IsString() department?: string;
   @IsOptional() @IsString() phone?: string;
   @IsOptional() @IsIn(['active', 'inactive']) status?: string;
-  @IsOptional() @IsArray() subjects?: string[];
+  @IsOptional() @IsArray() @IsUUID('4', { each: true }) subjects?: string[];
 }
 
 class CreateStudentDto {
@@ -35,7 +35,7 @@ class UpdateStudentDto {
   @IsOptional() @IsString() name?: string;
   @IsOptional() @IsEmail() email?: string;
   @IsOptional() @IsUUID() sectionId?: string;
-  @IsOptional() @IsInt() year?: number;
+  @IsOptional() @IsInt() @Min(1) @Max(6) year?: number;
   @IsOptional() @IsString() department?: string;
   @IsOptional() @IsIn(['active', 'inactive']) status?: string;
 }

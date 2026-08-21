@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { env } from '../../config/env';
 import { DatabaseService } from '../../database/database.service';
 import { MailService } from '../mail/mail.service';
+import { StorageService, BUCKETS } from '../storage/storage.service';
 import { hmacSha256, randomOtp, randomToken, safeEqual, sha256, verifyPassword } from '../../common/util/crypto';
 
 const ACCESS_TTL = '15m';
@@ -28,6 +29,7 @@ export type UserPayload = {
   sectionLabel: string | null;
   rollNo: string | null;
   overallAttendance: number | null;
+  avatarUrl: string | null;
 };
 
 @Injectable()
@@ -35,13 +37,14 @@ export class AuthService {
   constructor(
     private db: DatabaseService,
     private mail: MailService,
+    private storage: StorageService,
   ) {}
 
   /** Find an active user by email or portal id (STU-…, FAC-…, ADM-…). */
   private findUser(identifier: string) {
     const id = identifier.trim().toLowerCase();
     return this.db.queryOne<any>(
-      `select u.id, u.role, u.email, u.password_hash, u.display_name, u.status,
+      `select u.id, u.role, u.email, u.password_hash, u.display_name, u.status, u.avatar_path,
               f.faculty_id, f.designation, f.department,
               a.admin_id,
               s.student_id, s.year as student_year, s.department as student_dept,
@@ -64,18 +67,52 @@ export class AuthService {
    *  OTP-only and have no password hash at all. */
   async login(identifier: string, password: string, meta: { ip?: string; device?: string }) {
     const user = await this.findUser(identifier);
-    if (!user || user.role !== 'student' || !verifyPassword(password, user.password_hash)) {
-      throw new UnauthorizedException('Invalid credentials');
+    if (!user) {
+      throw new UnauthorizedException({
+        code: 'ACCOUNT_NOT_REGISTERED',
+        message: 'This email is not registered. Please contact your college administration.',
+      });
     }
-    if (user.status !== 'active') throw new ForbiddenException('Account is inactive');
+    if (user.role !== 'student') {
+      throw new UnauthorizedException({
+        code: 'INVALID_CREDENTIALS',
+        message: 'This account cannot sign in with password. Please use the correct portal.',
+      });
+    }
+    if (!verifyPassword(password, user.password_hash)) {
+      throw new UnauthorizedException({
+        code: 'INVALID_CREDENTIALS',
+        message: 'The password is incorrect.',
+      });
+    }
+    if (user.status !== 'active') throw new ForbiddenException({ code: 'ACCOUNT_INACTIVE', message: 'This account is inactive. Contact your college administration.' });
     return this.issueSession(user, meta);
   }
 
-  async requestOtp(identifier: string) {
+  async requestOtp(identifier: string, portal?: string) {
     const user = await this.findUser(identifier);
-    // Do not reveal whether the identifier exists.
-    if (!user || user.status !== 'active' || user.role === 'student') {
-      return { sent: true, expiresIn: OTP_TTL_MINUTES * 60 };
+    if (!user) {
+      throw new UnauthorizedException({
+        code: 'ACCOUNT_NOT_REGISTERED',
+        message: portal
+          ? `This email is not registered for the Westin ${portal === 'admin' ? 'Admin' : 'Faculty'} Portal.`
+          : 'This email is not registered. Please contact your college administration.',
+      });
+    }
+    if (user.status !== 'active') {
+      throw new ForbiddenException({ code: 'ACCOUNT_INACTIVE', message: 'This account is inactive. Contact your college administration.' });
+    }
+    if (user.role === 'student') {
+      throw new ForbiddenException({
+        code: 'PORTAL_ACCESS_DENIED',
+        message: 'This account cannot sign in to the Faculty/Admin Portal.',
+      });
+    }
+    if (portal && user.role !== portal) {
+      throw new ForbiddenException({
+        code: 'PORTAL_ACCESS_DENIED',
+        message: `This account cannot sign in to the Westin ${portal === 'admin' ? 'Admin' : 'Faculty'} Portal.`,
+      });
     }
 
     const recent = await this.db.queryOne<any>(
@@ -91,19 +128,30 @@ export class AuthService {
     }
 
     const code = randomOtp();
-    await this.db.query(
+    const inserted = await this.db.query<{ id: string }>(
       `insert into otp_codes (user_id, code_hash, expires_at)
-       values ($1, $2, now() + interval '${OTP_TTL_MINUTES} minutes')`,
+       values ($1, $2, now() + interval '${OTP_TTL_MINUTES} minutes') returning id`,
       [user.id, hmacSha256(env.otpPepper, code)],
     );
-    await this.mail.sendOtp(user.email, code, 'portal login');
+    const otpId = (inserted[0] as any)?.id;
+    try {
+      await this.mail.sendOtp(user.email, code, 'portal login');
+    } catch (err: any) {
+      // Clean up the OTP row so a failed delivery doesn't leave a usable code
+      if (otpId) await this.db.query(`delete from otp_codes where id=$1`, [otpId]).catch(() => {});
+      throw new BadRequestException(err.message || 'Failed to send OTP — please try again');
+    }
     return { sent: true, expiresIn: OTP_TTL_MINUTES * 60 };
   }
 
   async verifyOtp(identifier: string, code: string, meta: { ip?: string; device?: string }) {
     const user = await this.findUser(identifier);
-    if (!user || user.role === 'student' || user.status !== 'active') {
-      throw new UnauthorizedException('Invalid code');
+    if (!user) {
+      throw new UnauthorizedException({ code: 'ACCOUNT_NOT_REGISTERED', message: 'This email is not registered.' });
+    }
+    if (user.status !== 'active') throw new ForbiddenException({ code: 'ACCOUNT_INACTIVE', message: 'This account is inactive.' });
+    if (user.role === 'student') {
+      throw new ForbiddenException({ code: 'PORTAL_ACCESS_DENIED', message: 'This account cannot sign in to the Faculty/Admin Portal.' });
     }
 
     const otp = await this.db.queryOne<any>(
@@ -241,6 +289,14 @@ export class AuthService {
       );
       overallAttendance = row?.pct ?? null;
     }
+    let avatarUrl: string | null = null;
+    if (user.avatar_path) {
+      try {
+        avatarUrl = await this.storage.signedUrl(BUCKETS.profileAvatars, user.avatar_path, 3600);
+      } catch {
+        avatarUrl = null;
+      }
+    }
     return {
       id: user.id,
       role: user.role,
@@ -257,6 +313,7 @@ export class AuthService {
       sectionLabel: user.section_label ?? null,
       rollNo: user.roll_no ?? null,
       overallAttendance,
+      avatarUrl,
     };
   }
 }

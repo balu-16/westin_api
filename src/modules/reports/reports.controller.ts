@@ -46,7 +46,7 @@ export class ReportsController {
     return this.reports.create(dto, user.id);
   }
 
-  /** Faculty may delete their own reports; admins any. */
+  /** Reports are immutable — deletion is forbidden for all roles (DB trigger defense-in-depth). */
   @Delete(':id')
   @Roles('faculty', 'admin')
   remove(@Param('id') id: string, @CurrentUser() user: AuthUser) {

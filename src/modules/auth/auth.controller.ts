@@ -1,5 +1,5 @@
 import { Body, Controller, Get, HttpCode, Post, Req } from '@nestjs/common';
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Public } from '../../common/decorators/public.decorator';
 import type { AuthUser } from '../../common/guards/jwt-auth.guard';
@@ -12,11 +12,13 @@ class LoginDto {
 
 class OtpRequestDto {
   @IsString() @IsNotEmpty() identifier: string;
+  @IsOptional() @IsIn(['faculty', 'admin']) portal?: string;
 }
 
 class OtpVerifyDto {
   @IsString() @IsNotEmpty() identifier: string;
   @IsString() @IsNotEmpty() code: string;
+  @IsOptional() @IsIn(['faculty', 'admin']) portal?: string;
 }
 
 class RefreshDto {
@@ -42,13 +44,14 @@ export class AuthController {
   @Post('otp/request')
   @HttpCode(200)
   requestOtp(@Body() dto: OtpRequestDto) {
-    return this.auth.requestOtp(dto.identifier);
+    return this.auth.requestOtp(dto.identifier, dto.portal);
   }
 
   @Public()
   @Post('otp/verify')
   @HttpCode(200)
   verifyOtp(@Body() dto: OtpVerifyDto, @Req() req: any) {
+    // portal check is optional for verify; role already enforced in service
     return this.auth.verifyOtp(dto.identifier, dto.code, requestMeta(req));
   }
 

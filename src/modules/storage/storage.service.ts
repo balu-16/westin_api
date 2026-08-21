@@ -101,9 +101,30 @@ export class StorageService {
     if (!res.ok) throw new Error(`delete failed: ${await res.text()}`);
     this.signedUrlCache.delete(`${bucket}:${path}`);
   }
+
+  async objectExists(bucket: string, path: string): Promise<boolean> {
+    const res = await this.call(`/storage/v1/object/${bucket}/${path}`, {
+      method: 'HEAD',
+    });
+    if (res.ok) return true;
+    if (res.status === 404) return false;
+    // Some deployments return 400 for missing; treat 404-like as false, else throw
+    const text = await res.text().catch(() => '');
+    if (text.toLowerCase().includes('not found') || text.toLowerCase().includes('object not found')) return false;
+    throw new Error(`object check failed: ${text || res.status}`);
+  }
+
+  async headObject(bucket: string, path: string): Promise<{ exists: boolean; size?: number; contentType?: string }> {
+    const res = await this.call(`/storage/v1/object/${bucket}/${path}`, { method: 'HEAD' });
+    if (res.status === 404) return { exists: false };
+    if (!res.ok) throw new Error(`head failed: ${await res.text()}`);
+    const len = res.headers.get('content-length');
+    return { exists: true, size: len ? Number(len) : undefined, contentType: res.headers.get('content-type') ?? undefined };
+  }
 }
 
 export const BUCKETS = {
   studyMaterials: 'study-materials',       // 50 MB limit
   reportAttachments: 'report-attachments', // 20 MB limit
+  profileAvatars: 'profile-avatars',       // 5 MB limit
 } as const;

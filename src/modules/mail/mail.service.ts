@@ -20,9 +20,13 @@ export class MailService {
   }
 
   async sendOtp(to: string, code: string, purpose: string): Promise<void> {
-    // Always surface the code in the server log for dev/testing convenience.
-    this.logger.log(`OTP for ${to} (${purpose}): ${code}`);
-    if (!env.smtp.user || !env.smtp.pass) return;
+    if (env.otpLogToConsole) {
+      this.logger.log(`OTP for ${to} (${purpose}): ${code}`);
+    }
+    if (!env.smtp.user || !env.smtp.pass) {
+      if (!env.otpLogToConsole) this.logger.warn(`SMTP not configured — OTP for ${to} not sent`);
+      throw new Error('Email service not configured');
+    }
 
     await this.getTransport().sendMail({
       from: env.smtp.from,

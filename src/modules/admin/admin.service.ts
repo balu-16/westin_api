@@ -141,6 +141,17 @@ export class AdminService {
     );
     if (!existing) throw new NotFoundException('Teacher not found');
 
+    if (dto.email) {
+      const dup = await this.db.queryOne(`select 1 from users where lower(email)=lower($1) and id<>$2`, [dto.email, id]);
+      if (dup) throw new ConflictException(`Email ${dto.email} already exists`);
+    }
+    if (dto.subjects) {
+      for (const sid of dto.subjects) {
+        const sub = await this.db.queryOne(`select id from subjects where id=$1`, [sid]);
+        if (!sub) throw new BadRequestException(`Unknown subjectId ${sid}`);
+      }
+    }
+
     await this.db.tx(async (client) => {
       await client.query(`
         update users set display_name = coalesce($1, display_name),
@@ -161,7 +172,15 @@ export class AdminService {
         }
       }
     });
-    return { id };
+    this.cache.invalidate('students');
+    this.cache.invalidate('sections');
+    // return canonical updated row
+    const row = await this.db.queryOne<any>(`
+      select u.id, f.faculty_id as "facultyId", u.display_name as name, u.email,
+             f.designation, f.department, u.phone, u.status,
+             coalesce((select array_agg(sub.code) from faculty_subjects fs join subjects sub on sub.id=fs.subject_id where fs.faculty_id=u.id), '{}') as subjects
+        from users u join faculty_profiles f on f.user_id=u.id where u.id=$1`, [id]);
+    return row ?? { id };
   }
 
   async deleteTeacher(id: string) {
@@ -267,25 +286,70 @@ export class AdminService {
   }
 
   async updateStudent(id: string, dto: Partial<{ name: string; email: string; sectionId: string; year: number; department: string; status: string }>) {
-    const existing = await this.db.queryOne(
-      `select u.id from users u join student_profiles sp on sp.user_id = u.id where u.id = $1`, [id],
+    const existing = await this.db.queryOne<any>(
+      `select u.id, sp.section_id as cur_section from users u join student_profiles sp on sp.user_id=u.id where u.id=$1`, [id],
     );
     if (!existing) throw new NotFoundException('Student not found');
-    await this.db.tx(async (client) => {
-      await client.query(`
-        update users set display_name = coalesce($1, display_name), email = coalesce($2, email),
-                          status = coalesce($3::user_status, status), updated_at = now()
-         where id = $4
-      `, [dto.name ?? null, dto.email?.toLowerCase() ?? null, dto.status ?? null, id]);
-      await client.query(`
-        update student_profiles set section_id = coalesce($1, section_id), year = coalesce($2, year),
-                                    department = coalesce($3, department)
-         where user_id = $4
-      `, [dto.sectionId ?? null, dto.year ?? null, dto.department ?? null, id]);
-    });
+
+    if (dto.email) {
+      const dup = await this.db.queryOne(`select 1 from users where lower(email)=lower($1) and id<>$2`, [dto.email, id]);
+      if (dup) throw new ConflictException(`Email ${dto.email} already exists`);
+    }
+    if (dto.sectionId) {
+      const sec = await this.db.queryOne(`select id from sections where id=$1`, [dto.sectionId]);
+      if (!sec) throw new BadRequestException('Unknown sectionId');
+    }
+    if (dto.year != null && (dto.year < 1 || dto.year > 6)) throw new BadRequestException('year must be between 1 and 6');
+
+    // If section is being changed, use safe transfer logic (capacity + rollNo)
+    if (dto.sectionId && dto.sectionId !== existing.cur_section) {
+      await this.db.tx(async (client) => {
+        // lock destination section row and check capacity
+        const secRow = await client.query<{ label: string; max_strength: number; count: number }>(
+          `select s.label, s.max_strength, (select count(*)::int from student_profiles sp where sp.section_id=s.id) as count
+             from sections s where s.id=$1 for update`,
+          [dto.sectionId],
+        );
+        if (secRow.rows.length === 0) throw new BadRequestException('Unknown sectionId');
+        const section = secRow.rows[0];
+        if (section.count >= section.max_strength) throw new ConflictException(`Section ${section.label} is at max strength`);
+        const prefix = section.label.replace(/-\d+$/, '');
+        const rollNo = `${prefix}-${String(section.count + 1).padStart(2, '0')}`;
+
+        await client.query(`
+          update users set display_name=coalesce($1, display_name), email=coalesce($2, email),
+                           status=coalesce($3::user_status, status), updated_at=now()
+           where id=$4
+        `, [dto.name ?? null, dto.email?.toLowerCase() ?? null, dto.status ?? null, id]);
+        await client.query(`
+          update student_profiles set section_id=$1, roll_no=$2, year=coalesce($3, year), department=coalesce($4, department)
+           where user_id=$5
+        `, [dto.sectionId, rollNo, dto.year ?? null, dto.department ?? null, id]);
+      });
+    } else {
+      await this.db.tx(async (client) => {
+        await client.query(`
+          update users set display_name = coalesce($1, display_name), email = coalesce($2, email),
+                            status = coalesce($3::user_status, status), updated_at = now()
+           where id = $4
+        `, [dto.name ?? null, dto.email?.toLowerCase() ?? null, dto.status ?? null, id]);
+        await client.query(`
+          update student_profiles set year = coalesce($1, year), department = coalesce($2, department)
+           where user_id = $3
+        `, [dto.year ?? null, dto.department ?? null, id]);
+        // If sectionId provided but same as current, allow year/department update already handled; no roll change needed
+      });
+    }
     this.cache.invalidate('students');
     this.cache.invalidate('sections');
-    return { id };
+    const row = await this.db.queryOne<any>(`
+      select u.id, sp.student_id as "studentId", u.display_name as name, u.email,
+             sec.label as section, sp.section_id as "sectionId", sp.year, sp.department,
+             sp.roll_no as "rollNo", u.status
+        from users u join student_profiles sp on sp.user_id=u.id
+        left join sections sec on sec.id=sp.section_id
+       where u.id=$1`, [id]);
+    return row ?? { id };
   }
 
   async deleteStudent(id: string) {
