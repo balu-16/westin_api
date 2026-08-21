@@ -83,9 +83,9 @@ export class MaterialsService {
         throw new BadRequestException('sort must be one of latest, oldest, name, size');
     }
 
-    // Enforce bounded pageSize (default 20, max 50 for materials per spec)
+    // Enforce bounded pageSize (default 10, max 50)
     const rawPg = pageParams(page, pageSize);
-    const defaultSize = pageSize == null || String(pageSize).trim() === '' ? 20 : rawPg.pageSize;
+    const defaultSize = pageSize == null || String(pageSize).trim() === '' ? 10 : rawPg.pageSize;
     const effPageSize = Math.min(defaultSize, 50);
     const effPg = { ...rawPg, pageSize: effPageSize, limit: effPageSize, offset: (rawPg.page - 1) * effPageSize };
     const limitIdx = params.length + 1;

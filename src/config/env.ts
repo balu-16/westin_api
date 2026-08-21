@@ -40,6 +40,11 @@ export const env = {
   // Set true only when deployed behind a reverse proxy you control — Express
   // then derives req.ip from X-Forwarded-For of that trusted hop only.
   trustProxy: (process.env.TRUST_PROXY ?? 'false') === 'true',
+  onesignal: {
+    appId: process.env.ONESIGNAL_APP_ID ?? '88500375-185d-4ea7-b3fc-bf32b8280b3b',
+    restApiKey: process.env.ONESIGNAL_REST_API_KEY ?? '',
+    apiUrl: (process.env.ONESIGNAL_API_URL ?? 'https://onesignal.com/api/v1').replace(/\/$/, ''),
+  },
 };
 
 function required(name: string): string {

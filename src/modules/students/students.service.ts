@@ -106,11 +106,13 @@ export class StudentsService {
   async updateSettings(studentId: string, dto: Partial<{ push: boolean; email: boolean; announcements: boolean; reminders: boolean; theme: string }>) {
     const current = await this.getSettings(studentId);
     const merged = { ...current, ...dto };
+    // theme may be null if old row has null or client omits it after light-theme removal — keep existing or default to light
+    const theme = (merged as any).theme ?? current.theme ?? 'light';
     await this.db.query(`
       insert into user_settings (user_id, push, email, announcements, reminders, theme)
       values ($1, $2, $3, $4, $5, $6)
       on conflict (user_id) do update set push = $2, email = $3, announcements = $4, reminders = $5, theme = $6, updated_at = now()
-    `, [studentId, merged.push, merged.email, merged.announcements, merged.reminders, merged.theme]);
-    return merged;
+    `, [studentId, merged.push, merged.email, merged.announcements, merged.reminders, theme]);
+    return { ...merged, theme };
   }
 }

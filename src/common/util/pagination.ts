@@ -11,10 +11,10 @@ export type PageParams = {
   offset: number;
 };
 
-export const DEFAULT_PAGE_SIZE = 50;
-export const MAX_PAGE_SIZE = 100;
+export const DEFAULT_PAGE_SIZE = 10;
+export const MAX_PAGE_SIZE = 50;
 
-/** Defaults: page=1, pageSize=50; pageSize capped at 100; garbage -> defaults. */
+/** Defaults: page=1, pageSize=10; pageSize capped at 50; garbage -> defaults. */
 export function pageParams(page?: number | string, pageSize?: number | string): PageParams {
   const p = Math.max(1, Math.floor(Number(page)) || 1);
   const size = Math.min(MAX_PAGE_SIZE, Math.max(1, Math.floor(Number(pageSize)) || DEFAULT_PAGE_SIZE));

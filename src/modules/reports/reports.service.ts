@@ -56,15 +56,24 @@ export class ReportsService {
     private storage: StorageService,
   ) {}
 
-  /** Own reports, newest first. */
-  async mine(userId: string): Promise<DailyReportJson[]> {
-    const rows = await this.db.query<ReportRow>(
-      `${REPORT_SELECT}
+  /** Own reports, newest first — paginated (default 10). */
+  async mine(userId: string, page?: string | number, pageSize?: string | number) {
+    const pg = pageParams(page, pageSize);
+    const rows = await this.db.query<ReportRow & { __total?: string | number }>(
+      `${REPORT_FIELDS}, count(*) over() as "__total" ${REPORT_JOINS}
         where r.faculty_id = $1::uuid
-        order by r.report_date desc, r.created_at desc`,
-      [userId],
+        order by r.report_date desc, r.created_at desc
+        limit $2 offset $3`,
+      [userId, pg.limit, pg.offset],
     );
-    return Promise.all(rows.map((r) => this.mapReport(r)));
+    const mapped = await Promise.all(
+      rows.map(async (r) => {
+        const { __total, ...rest } = r;
+        const json = await this.mapReport(rest as ReportRow);
+        return Object.assign(json, { __total });
+      }),
+    );
+    return paginatedEnvelope<DailyReportJson>(mapped as any, pg);
   }
 
   /** Admin listing of everyone's reports with filters + search. */

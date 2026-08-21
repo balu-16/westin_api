@@ -9,11 +9,11 @@ import { CreateReportDto, ReportUploadUrlDto } from './dto';
 export class ReportsController {
   constructor(private reports: ReportsService) {}
 
-  /** Own reports, newest first. */
+  /** Own reports, newest first — paginated. */
   @Get('mine')
   @Roles('faculty')
-  mine(@CurrentUser() user: AuthUser) {
-    return this.reports.mine(user.id);
+  mine(@CurrentUser() user: AuthUser, @Query('page') page?: string, @Query('pageSize') pageSize?: string) {
+    return this.reports.mine(user.id, page, pageSize);
   }
 
   /** Admin listing of all reports (with faculty names) + filters. */
