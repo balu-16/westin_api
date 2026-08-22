@@ -48,7 +48,7 @@ export class NotificationsService {
       `select receive_from_other_admins from admin_notification_settings where admin_id=$1`,
       [adminId],
     );
-    return { receiveFromOtherAdmins: row?.receive_from_other_admins ?? false };
+    return { receiveFromOtherAdmins: row?.receive_from_other_admins ?? true };
   }
 
   async putSettings(adminId: string, value: boolean) {
@@ -179,11 +179,11 @@ export class NotificationsService {
            left join admin_notification_settings s on s.admin_id=u.id
           where u.role='admin' and u.status='active'
             and u.id <> $1::uuid
-            and coalesce(s.receive_from_other_admins,false)=true`,
+            and coalesce(s.receive_from_other_admins,true)=true`,
         [input.senderAdminId],
       );
       if (rows.length === 0) {
-        throw new BadRequestException('No admins have opted in to receive notifications.');
+        throw new BadRequestException('No other active admins to notify (all opted out).');
       }
       recipients = rows.map((r) => ({ id: r.id, role: 'admin' as const }));
     } else {
@@ -239,10 +239,17 @@ export class NotificationsService {
     const restKey = env.onesignal.restApiKey;
     const apiUrl = env.onesignal.apiUrl;
 
-    // If key not configured (local dev without OneSignal), skip remote call but still audit.
-    // In production Vercel env the key must be set — we log a warning instead of throwing
-    // so local `npm run dev` without the key still exercises the audit flow.
-    if (!restKey || restKey === 'REPLACE_WITH_REAL_REST_API_KEY' || restKey.trim() === '') {
+    // Key not configured: local dev skips the remote call so the audit flow can still be
+    // exercised without OneSignal. Production must fail loudly — a silent skip makes the
+    // send look successful in the UI while nothing is ever delivered.
+    const keyMissing = !restKey || restKey.trim() === '' || restKey === 'REPLACE_WITH_REAL_REST_API_KEY';
+    if (keyMissing) {
+      if (process.env.NODE_ENV === 'production') {
+        this.logger.error('ONESIGNAL_REST_API_KEY not configured in production — rejecting send');
+        throw new ServiceUnavailableException(
+          'Push notifications are not configured on the server (missing OneSignal REST API key). Nothing was sent.',
+        );
+      }
       this.logger.warn('ONESIGNAL_REST_API_KEY not configured — skipping OneSignal REST call (audit still recorded).');
       return null;
     }
