@@ -254,53 +254,73 @@ export class NotificationsService {
       return null;
     }
 
-    const body: Record<string, unknown> = {
-      app_id: appId,
-      include_aliases: { external_id: args.externalIds },
-      target_channel: 'push',
-      headings: { en: args.title },
-      contents: { en: args.message },
-    };
+    // OneSignal rejects the ENTIRE send with `invalid_aliases` if any external_id maps to a
+    // subscription in an invalid state (e.g. a browser that blocked the permission prompt —
+    // notification_types -2, no token). The error lists the bad aliases, so drop them and
+    // retry with the valid subset: one poisoned recipient must not block everyone else.
+    let externalIds = args.externalIds;
+    for (let attempt = 0; ; attempt++) {
+      const body: Record<string, unknown> = {
+        app_id: appId,
+        include_aliases: { external_id: externalIds },
+        target_channel: 'push',
+        headings: { en: args.title },
+        contents: { en: args.message },
+      };
 
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 8000);
-    let res: Response;
-    try {
-      res = await fetch(`${apiUrl}/notifications`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Key ${restKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (e: any) {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 8000);
+      let res: Response;
+      try {
+        res = await fetch(`${apiUrl}/notifications`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Key ${restKey}`,
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (e: any) {
+        clearTimeout(t);
+        if (e?.name === 'AbortError') throw new ServiceUnavailableException('OneSignal request timed out');
+        throw new ServiceUnavailableException(`OneSignal request failed: ${e?.message ?? String(e)}`);
+      }
       clearTimeout(t);
-      if (e?.name === 'AbortError') throw new ServiceUnavailableException('OneSignal request timed out');
-      throw new ServiceUnavailableException(`OneSignal request failed: ${e?.message ?? String(e)}`);
-    }
-    clearTimeout(t);
 
-    const text = await res.text();
-    let json: any = null;
-    try {
-      json = text ? JSON.parse(text) : null;
-    } catch {
-      json = { raw: text };
-    }
+      const text = await res.text();
+      let json: any = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = { raw: text };
+      }
 
-    if (!res.ok) {
-      const msg = json?.errors?.[0] ?? json?.error ?? json?.message ?? text ?? `OneSignal error ${res.status}`;
-      this.logger.error(`OneSignal send failed ${res.status}: ${JSON.stringify(json)}`);
-      // Surface as 400 so frontend shows actionable toast instead of 500
-      throw new BadRequestException(`Push delivery failed: ${String(msg).slice(0, 300)}`);
-    }
+      const invalid: string[] = json?.errors?.invalid_aliases?.external_id ?? [];
+      if (!res.ok && invalid.length > 0 && externalIds.length > invalid.length && attempt < 3) {
+        this.logger.warn(
+          `OneSignal invalid_aliases (${invalid.length}) — retrying with ${externalIds.length - invalid.length}/${externalIds.length} external_ids`,
+        );
+        const bad = new Set<string>(invalid);
+        externalIds = externalIds.filter((id) => !bad.has(id));
+        continue;
+      }
 
-    // Response shape: { id: "<onesignal-notification-id>", recipients: <int>, ... }
-    const nid: string | null = (json?.id as string) ?? (json?.notification_id as string) ?? null;
-    if (!nid) this.logger.warn(`OneSignal sent but no id in response: ${text.slice(0, 500)}`);
-    this.logger.log(`OneSignal sent id=${nid ?? 'n/a'} to ${args.externalIds.length} external_ids`);
-    return nid;
+      if (!res.ok) {
+        const msg =
+          invalid.length > 0
+            ? `All ${externalIds.length} recipients have invalid push subscriptions (permission blocked or never granted)`
+            : (json?.errors?.[0] ?? json?.error ?? json?.message ?? text ?? `OneSignal error ${res.status}`);
+        this.logger.error(`OneSignal send failed ${res.status}: ${JSON.stringify(json)}`);
+        // Surface as 400 so frontend shows actionable toast instead of 500
+        throw new BadRequestException(`Push delivery failed: ${String(msg).slice(0, 300)}`);
+      }
+
+      // Response shape: { id: "<onesignal-notification-id>", recipients: <int>, ... }
+      const nid: string | null = (json?.id as string) ?? (json?.notification_id as string) ?? null;
+      if (!nid) this.logger.warn(`OneSignal sent but no id in response: ${text.slice(0, 500)}`);
+      this.logger.log(`OneSignal sent id=${nid ?? 'n/a'} to ${externalIds.length} external_ids`);
+      return nid;
+    }
   }
 }
