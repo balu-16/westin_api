@@ -99,6 +99,12 @@ export class NotificationsController {
     return this.svc.markRead(user.id, id);
   }
 
+  @Post('notifications/thanks')
+  @Roles('faculty', 'student', 'admin')
+  subscriptionThanks(@CurrentUser() user: AuthUser) {
+    return this.svc.sendSubscriptionThanks({ id: user.id, role: user.role });
+  }
+
   @Post('notifications/send')
   @Roles('admin')
   send(@CurrentUser() user: AuthUser, @Body() dto: SendNotificationDto) {

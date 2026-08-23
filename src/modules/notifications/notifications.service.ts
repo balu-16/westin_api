@@ -201,6 +201,29 @@ export class NotificationsService {
     return { ok: true };
   }
 
+  /**
+   * Courtesy push sent when a user subscribes for the FIRST time (frontend fires
+   * POST /notifications/thanks from OneSignal's PushSubscription change event when
+   * a brand-new subscription is created). Not recorded in admin History — it is a
+   * welcome, not a college notification.
+   */
+  async sendSubscriptionThanks(user: { id: string; role: 'faculty' | 'admin' | 'student' }) {
+    const app: 'faculty' | 'student' = user.role === 'student' ? 'student' : 'faculty';
+    try {
+      const nid = await this.callOneSignal({
+        title: 'Westin',
+        message: 'Thanks for subscribing — college notifications will now reach you here.',
+        externalIds: [getOneSignalExternalId(user)],
+        app,
+      });
+      return { sent: !!nid };
+    } catch (err) {
+      // Courtesy push only — never break the login/subscription flow.
+      this.logger.warn(`subscription thanks push failed: ${(err as Error).message}`);
+      return { sent: false };
+    }
+  }
+
   // ---------- send ----------
 
   async send(input: SendInput) {
