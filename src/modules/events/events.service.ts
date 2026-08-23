@@ -1,7 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
 import { CacheService } from '../../common/cache/cache.service';
 import { kolkataNow } from '../../common/util/time';
+import { NotificationsService } from '../notifications/notifications.service';
 import { CreateEventDto, UpdateEventDto } from './dto';
 
 type EventRow = {
@@ -37,9 +38,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 @Injectable()
 export class EventsService {
+  private readonly logger = new Logger(EventsService.name);
+
   constructor(
     private db: DatabaseService,
     private cache: CacheService,
+    private notifications: NotificationsService,
   ) {}
 
   /** Aggregated payload for the events page (any authenticated role).
@@ -108,6 +112,7 @@ export class EventsService {
       ],
     );
     this.cache.invalidate('events');
+    this.pushEvent('New Event', row!);
     return mapEvent(row!);
   }
 
@@ -149,6 +154,15 @@ export class EventsService {
       params,
     );
     this.cache.invalidate('events');
+    // Only schedule-relevant edits are worth a push — description/category/isLive
+    // tweaks must not blast everyone again.
+    const materialChange =
+      (dto.title !== undefined && dto.title.trim() !== existing.title) ||
+      (dto.startDate !== undefined && dto.startDate !== existing.start_date) ||
+      (dto.endDate !== undefined && (dto.endDate ?? null) !== existing.end_date) ||
+      (dto.time !== undefined && (dto.time?.trim() || null) !== existing.event_time) ||
+      (dto.location !== undefined && (dto.location?.trim() || null) !== existing.location);
+    if (materialChange) this.pushEvent('Event Updated', row!);
     return mapEvent(row!);
   }
 
@@ -157,6 +171,26 @@ export class EventsService {
     await this.db.query(`delete from events where id = $1`, [id]);
     this.cache.invalidate('events');
     return { deleted: true };
+  }
+
+  /** Push a created/updated event to all active students + faculty (fire-and-forget). */
+  private pushEvent(prefix: 'New Event' | 'Event Updated', e: EventRow) {
+    void (async () => {
+      const recipients = [
+        ...(await this.notifications.activeFaculty()),
+        ...(await this.notifications.activeStudents()),
+      ];
+      if (recipients.length === 0) return;
+      const when =
+        e.end_date && e.end_date !== e.start_date ? `${e.start_date} to ${e.end_date}` : e.start_date;
+      await this.notifications.sendSystem({
+        kind: 'event',
+        title: `${prefix}: ${e.title}`,
+        message: `${when}${e.event_time ? ` at ${e.event_time}` : ''}${e.location ? ` • ${e.location}` : ''}`,
+        recipients,
+      });
+      this.logger.log(`event push "${e.title}" (${prefix.toLowerCase()}) → ${recipients.length} recipients`);
+    })().catch((err) => this.logger.warn(`event push failed: ${(err as Error).message}`));
   }
 
   private async findOneRow(id: string): Promise<EventRow> {

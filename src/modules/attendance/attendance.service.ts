@@ -1,5 +1,6 @@
-import { BadRequestException, Injectable, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, UnprocessableEntityException } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { kolkataNow, monthEnd, monthShift, monthStart } from '../../common/util/time';
 
 const VALID_STATUSES = new Set(['present', 'absent', 'leave']);
@@ -8,7 +9,12 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 @Injectable()
 export class AttendanceService {
-  constructor(private db: DatabaseService) {}
+  private readonly logger = new Logger(AttendanceService.name);
+
+  constructor(
+    private db: DatabaseService,
+    private notifications: NotificationsService,
+  ) {}
 
   /** Faculty-facing roster with any existing marks for the slot. */
   async roster(facultyId: string, sectionId: string, date: string, period: string) {
@@ -81,7 +87,7 @@ export class AttendanceService {
       seen.add(r.studentId);
     }
 
-    return this.db.tx(async (client) => {
+    const result = await this.db.tx(async (client) => {
       // Date cutoff — authoritative DB Asia/Kolkata date
       const todayRow = await client.query<{ today: string }>(`select (now() at time zone 'Asia/Kolkata')::date::text as today`);
       const today = todayRow.rows[0]?.today;
@@ -133,6 +139,15 @@ export class AttendanceService {
       );
       const sessionId = session.rows[0].id;
 
+      // Prior statuses before the upsert overwrites them — only students who are
+      // NEWLY absent (previously present/leave/unmarked) get a push, so editing
+      // marks never re-spams an already-absent student.
+      const priorRows = await client.query<{ student_id: string; status: string }>(
+        `select student_id, status from attendance_records where session_id = $1`,
+        [sessionId],
+      );
+      const prior = new Map(priorRows.rows.map((r) => [r.student_id, r.status]));
+
       const counts = { present: 0, absent: 0, leave: 0 };
       const studentIds: string[] = [];
       const statuses: string[] = [];
@@ -150,8 +165,42 @@ export class AttendanceService {
          do update set status = excluded.status, marked_at = now()`,
         [sessionId, studentIds, statuses],
       );
-      return { counts };
+
+      const newlyAbsent = dto.records
+        .filter((r) => r.status === 'absent' && prior.get(r.studentId) !== 'absent')
+        .map((r) => r.studentId);
+      return { counts, newlyAbsent };
     });
+
+    // Push after the tx commits — a push outage must never roll back attendance.
+    if (result.newlyAbsent.length > 0) {
+      void this.notifyAbsentStudents(result.newlyAbsent, dto).catch((err) =>
+        this.logger.warn(`absent push failed: ${(err as Error).message}`),
+      );
+    }
+    return { counts: result.counts };
+  }
+
+  /** Tell newly-absent students they were marked absent (fire-and-forget). */
+  private async notifyAbsentStudents(
+    studentIds: string[],
+    dto: { date: string; period: string; subjectId?: string },
+  ) {
+    let subject = 'a class';
+    if (dto.subjectId) {
+      const subj = await this.db.queryOne<{ name: string }>(`select name from subjects where id = $1`, [
+        dto.subjectId,
+      ]);
+      if (subj?.name) subject = subj.name;
+    }
+    const periodNo = dto.period.startsWith('h') ? dto.period.slice(1) : dto.period;
+    await this.notifications.sendSystem({
+      kind: 'attendance_absent',
+      title: 'Absent Marked',
+      message: `You were marked absent for ${subject} on ${dto.date} (Period ${periodNo}). If this is a mistake, contact your class teacher.`,
+      recipients: studentIds.map((id) => ({ id, role: 'student' as const })),
+    });
+    this.logger.log(`absent push → ${studentIds.length} students (${subject}, ${dto.date} P${periodNo})`);
   }
 
   /** Full student attendance page payload. */

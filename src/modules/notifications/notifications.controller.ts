@@ -1,10 +1,10 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Put, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, ParseUUIDPipe, Patch, Post, Put, Query } from '@nestjs/common';
 import { IsBoolean, IsOptional, IsString } from 'class-validator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { AuthUser } from '../../common/guards/jwt-auth.guard';
 import { NotificationsService } from './notifications.service';
-import { SendNotificationDto } from './notifications.dto';
+import { CreateTemplateDto, SendNotificationDto, UpdateTemplateDto } from './notifications.dto';
 
 class SettingsBodyDto {
   @IsOptional()
@@ -103,6 +103,33 @@ export class NotificationsController {
   @Roles('faculty', 'student', 'admin')
   subscriptionThanks(@CurrentUser() user: AuthUser) {
     return this.svc.sendSubscriptionThanks({ id: user.id, role: user.role });
+  }
+
+  // ---------- predefined templates ----------
+
+  @Get('notifications/templates')
+  @Roles('admin')
+  listTemplates() {
+    return this.svc.listTemplates();
+  }
+
+  @Post('notifications/templates')
+  @HttpCode(200)
+  @Roles('admin')
+  createTemplate(@CurrentUser() user: AuthUser, @Body() dto: CreateTemplateDto) {
+    return this.svc.createTemplate(dto, user.id);
+  }
+
+  @Patch('notifications/templates/:id')
+  @Roles('admin')
+  updateTemplate(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateTemplateDto) {
+    return this.svc.updateTemplate(id, dto);
+  }
+
+  @Delete('notifications/templates/:id')
+  @Roles('admin')
+  deleteTemplate(@Param('id', ParseUUIDPipe) id: string) {
+    return this.svc.deleteTemplate(id);
   }
 
   @Post('notifications/send')

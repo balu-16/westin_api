@@ -1,6 +1,7 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
 import type { Role } from '../../common/decorators/roles.decorator';
+import { NotificationsService } from '../notifications/notifications.service';
 import { CreateAnnouncementDto, UpdateAnnouncementDto } from './dto';
 
 type AnnouncementRow = {
@@ -25,7 +26,12 @@ export type AnnouncementJson = {
 
 @Injectable()
 export class AnnouncementsService {
-  constructor(private db: DatabaseService) {}
+  private readonly logger = new Logger(AnnouncementsService.name);
+
+  constructor(
+    private db: DatabaseService,
+    private notifications: NotificationsService,
+  ) {}
 
   /**
    * Newest first. Students only see announcements addressed to them
@@ -50,7 +56,33 @@ export class AnnouncementsService {
        returning id, title, message, category, audience, created_at`,
       [dto.title.trim(), dto.message.trim(), dto.category ?? 'general', dto.audience ?? 'all'],
     );
+    this.pushCreated(row!);
     return mapAnnouncement(row!);
+  }
+
+  /**
+   * Push the new announcement to its audience: 'students' → students,
+   * 'faculty' → faculty, 'all' → both. Fire-and-forget — the row is already
+   * committed and a push outage must not fail the announcement creation.
+   */
+  private pushCreated(a: AnnouncementRow) {
+    void (async () => {
+      const recipients: Array<{ id: string; role: 'faculty' | 'student' }> = [];
+      if (a.audience === 'all' || a.audience === 'faculty') {
+        recipients.push(...(await this.notifications.activeFaculty()));
+      }
+      if (a.audience === 'all' || a.audience === 'students') {
+        recipients.push(...(await this.notifications.activeStudents()));
+      }
+      if (recipients.length === 0) return;
+      await this.notifications.sendSystem({
+        kind: 'announcement',
+        title: a.title,
+        message: a.message,
+        recipients,
+      });
+      this.logger.log(`announcement "${a.title}" pushed to ${recipients.length} recipients`);
+    })().catch((err) => this.logger.warn(`announcement push failed: ${(err as Error).message}`));
   }
 
   async update(id: string, dto: UpdateAnnouncementDto): Promise<AnnouncementJson> {

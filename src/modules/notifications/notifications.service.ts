@@ -1,6 +1,7 @@
-import { BadRequestException, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
 import { env } from '../../config/env';
+import { CreateTemplateDto, UpdateTemplateDto } from './notifications.dto';
 
 /**
  * OneSignal Web Push — server-side only.
@@ -82,6 +83,70 @@ export class NotificationsService {
     return { receiveFromOtherAdmins: value };
   }
 
+  // ---------- templates ----------
+
+  /** Predefined messages for the Send page picker. Shared pool across admins. */
+  async listTemplates(): Promise<TemplateJson[]> {
+    const rows = await this.db.query<TemplateRow>(
+      `select id, name, title, message, target_type, created_at, updated_at
+         from notification_templates
+        order by name asc`,
+    );
+    return rows.map(mapTemplate);
+  }
+
+  async createTemplate(dto: CreateTemplateDto, adminId: string): Promise<TemplateJson> {
+    const row = await this.db.queryOne<TemplateRow>(
+      `insert into notification_templates (name, title, message, target_type, created_by)
+       values ($1, $2, $3, $4::notification_target, $5)
+       returning id, name, title, message, target_type, created_at, updated_at`,
+      [dto.name.trim(), dto.title.trim(), dto.message.trim(), dto.target_type ?? null, adminId],
+    );
+    return mapTemplate(row!);
+  }
+
+  async updateTemplate(id: string, dto: UpdateTemplateDto): Promise<TemplateJson> {
+    await this.findOneTemplateRow(id);
+
+    const sets: string[] = ['updated_at = now()'];
+    const params: unknown[] = [];
+    const set = (column: string, value: unknown) => {
+      params.push(value);
+      sets.push(`${column} = $${params.length}`);
+    };
+    if (dto.name !== undefined) set('name', dto.name.trim());
+    if (dto.title !== undefined) set('title', dto.title.trim());
+    if (dto.message !== undefined) set('message', dto.message.trim());
+    // explicit null clears the default target
+    if (dto.target_type !== undefined) set('target_type', dto.target_type);
+
+    const updated = await this.db.queryOne<TemplateRow>(
+      `update notification_templates set ${sets.join(', ')}
+        where id = $${params.length + 1}::uuid
+        returning id, name, title, message, target_type, created_at, updated_at`,
+      [...params, id],
+    );
+    if (!updated) throw new NotFoundException('Template not found');
+    return mapTemplate(updated);
+  }
+
+  async deleteTemplate(id: string) {
+    await this.findOneTemplateRow(id);
+    await this.db.query(`delete from notification_templates where id = $1`, [id]);
+    return { deleted: true };
+  }
+
+  private async findOneTemplateRow(id: string): Promise<TemplateRow> {
+    if (!UUID_RE.test(id)) throw new NotFoundException('Template not found');
+    const row = await this.db.queryOne<TemplateRow>(
+      `select id, name, title, message, target_type, created_at, updated_at
+         from notification_templates where id = $1::uuid`,
+      [id],
+    );
+    if (!row) throw new NotFoundException('Template not found');
+    return row;
+  }
+
   // ---------- history ----------
 
   async history(params: {
@@ -105,13 +170,13 @@ export class NotificationsService {
     if (to && Number.isNaN(to.getTime())) throw new BadRequestException('Invalid to date');
 
     const rows = await this.db.query<any>(
-      `select n.id, n.sender_admin_id as "senderAdminId", u.display_name as "senderName",
+      `select n.id, n.sender_admin_id as "senderAdminId", coalesce(u.display_name, 'System') as "senderName",
               n.message_title as "messageTitle", n.message_body as "messageBody",
-              n.target_type as "targetType", n.created_at as "createdAt",
+              n.target_type as "targetType", n.kind as "kind", n.created_at as "createdAt",
               n.onesignal_notification_id as "onesignalNotificationId",
               count(r.id)::int as "recipientCount"
          from notifications n
-         join users u on u.id=n.sender_admin_id
+         left join users u on u.id=n.sender_admin_id
          left join notification_recipients r on r.notification_id=n.id
         where ($1::uuid is null or n.sender_admin_id=$1::uuid)
           and ($2::timestamptz is null or n.created_at >= $2::timestamptz)
@@ -134,11 +199,11 @@ export class NotificationsService {
 
   async historyDetail(id: string) {
     const notif = await this.db.queryOne<any>(
-      `select n.id, n.sender_admin_id as "senderAdminId", u.display_name as "senderName",
+      `select n.id, n.sender_admin_id as "senderAdminId", coalesce(u.display_name, 'System') as "senderName",
               n.message_title as "messageTitle", n.message_body as "messageBody",
-              n.target_type as "targetType", n.created_at as "createdAt",
+              n.target_type as "targetType", n.kind as "kind", n.created_at as "createdAt",
               n.onesignal_notification_id as "onesignalNotificationId"
-         from notifications n join users u on u.id=n.sender_admin_id where n.id=$1`,
+         from notifications n left join users u on u.id=n.sender_admin_id where n.id=$1`,
       [id],
     );
     if (!notif) throw new BadRequestException('Notification not found');
@@ -238,11 +303,7 @@ export class NotificationsService {
     let recipients: Array<{ id: string; role: 'faculty' | 'admin' | 'student' }> = [];
 
     if (input.target_type === 'all_faculty') {
-      const rows = await this.db.query<{ id: string }>(
-        `select u.id from users u join faculty_profiles f on f.user_id=u.id
-          where u.role='faculty' and u.status='active'`,
-      );
-      recipients = rows.map((r) => ({ id: r.id, role: 'faculty' as const }));
+      recipients = await this.activeFaculty();
       if (recipients.length === 0) throw new BadRequestException('No active faculty found');
     } else if (input.target_type === 'selected_faculty') {
       const ids = [...new Set((input.faculty_ids ?? []).map((s) => s.trim()).filter(Boolean))];
@@ -273,11 +334,7 @@ export class NotificationsService {
       }
       recipients = rows.map((r) => ({ id: r.id, role: 'admin' as const }));
     } else if (input.target_type === 'all_students') {
-      const rows = await this.db.query<{ id: string }>(
-        `select u.id from users u join student_profiles sp on sp.user_id = u.id
-          where u.role='student' and u.status='active'`,
-      );
-      recipients = rows.map((r) => ({ id: r.id, role: 'student' as const }));
+      recipients = await this.activeStudents();
       if (recipients.length === 0) throw new BadRequestException('No active students found');
     } else if (input.target_type === 'selected_students') {
       const ids = [...new Set((input.student_ids ?? []).map((s) => s.trim()).filter(Boolean))];
@@ -344,6 +401,113 @@ export class NotificationsService {
       onesignalNotificationId: onesignalId,
       recipientCount: recipients.length,
     };
+  }
+
+  // ---------- system sends (auto triggers) ----------
+
+  /**
+   * System-generated push (announcement posted, event added, student marked
+   * absent, daily-report reminder). Recipients are resolved by the caller;
+   * this validates, pushes once per OneSignal app (faculty/admin subscribe on
+   * the faculty origin, students on their own), and records the audit rows
+   * with a null sender. Callers fire-and-forget with a catch: a push failure
+   * must never break the business action that triggered it.
+   */
+  async sendSystem(input: {
+    kind: 'announcement' | 'event' | 'attendance_absent' | 'report_reminder';
+    title: string;
+    message: string;
+    recipients: Array<{ id: string; role: 'faculty' | 'admin' | 'student' }>;
+  }): Promise<void> {
+    const title = input.title?.trim();
+    const message = input.message?.trim();
+    if (!title || !message || title.length > 120 || message.length > 500) {
+      throw new BadRequestException('Invalid system notification payload');
+    }
+
+    // Dedupe — a recipient appearing twice (bad trigger input) must not double-push.
+    const seen = new Set<string>();
+    let recipients = input.recipients.filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+
+    // Kind-scoped audiences: absent marks concern students only, report
+    // reminders faculty only. Filter defensively so a caller passing the wrong
+    // roles (e.g. a future trigger bug) can never leak across audiences.
+    if (input.kind === 'attendance_absent') {
+      recipients = recipients.filter((r) => r.role === 'student');
+    } else if (input.kind === 'report_reminder') {
+      recipients = recipients.filter((r) => r.role === 'faculty');
+    }
+    if (recipients.length === 0) return;
+
+    const facultySide = recipients.filter((r) => r.role !== 'student');
+    const studentSide = recipients.filter((r) => r.role === 'student');
+
+    // Per-app: "nobody on this app has subscribed yet" is a normal early-adoption
+    // state for auto triggers — skip that app instead of failing the whole send
+    // (manual admin sends still fail loudly by design).
+    const pushApp = async (app: 'faculty' | 'student', side: typeof recipients) => {
+      try {
+        return await this.callOneSignal({
+          title,
+          message,
+          externalIds: side.map(getOneSignalExternalId),
+          app,
+        });
+      } catch (err) {
+        if (
+          err instanceof BadRequestException &&
+          /not subscribed|invalid push subscriptions/i.test(String(err.message))
+        ) {
+          this.logger.warn(
+            `system push (${input.kind}) skipped on ${app} app — none of ${side.length} recipients subscribed`,
+          );
+          return null;
+        }
+        throw err;
+      }
+    };
+
+    const ids: (string | null)[] = [];
+    if (facultySide.length > 0) ids.push(await pushApp('faculty', facultySide));
+    if (studentSide.length > 0) ids.push(await pushApp('student', studentSide));
+    if (ids.every((x) => x === null)) {
+      this.logger.warn(`system push (${input.kind}) reached nobody — no audit rows written`);
+      return;
+    }
+    const onesignalId = ids.filter((x): x is string => !!x).join(',') || null;
+
+    await this.db.tx(async (client) => {
+      const nres = await client.query(
+        `insert into notifications (sender_admin_id, message_title, message_body, target_type, kind, onesignal_notification_id)
+         values (null, $1, $2, 'system', $3, $4) returning id`,
+        [title, message, input.kind, onesignalId],
+      );
+      const nid = nres.rows[0].id as string;
+      const recipientIds = recipients.map((r) => r.id);
+      const types = recipients.map((r) => r.role);
+      await client.query(
+        `insert into notification_recipients (notification_id, recipient_type, recipient_id)
+         select $1::uuid, unnest($2::recipient_type[]), unnest($3::uuid[])`,
+        [nid, types, recipientIds],
+      );
+    });
+  }
+
+  /** Shared recipient resolution for broadcast + system sends (also used by trigger modules). */
+  async activeFaculty(): Promise<Array<{ id: string; role: 'faculty' }>> {
+    const rows = await this.db.query<{ id: string }>(
+      `select u.id from users u join faculty_profiles f on f.user_id=u.id
+        where u.role='faculty' and u.status='active'`,
+    );
+    return rows.map((r) => ({ id: r.id, role: 'faculty' as const }));
+  }
+
+  async activeStudents(): Promise<Array<{ id: string; role: 'student' }>> {
+    const rows = await this.db.query<{ id: string }>(
+      `select u.id from users u join student_profiles sp on sp.user_id = u.id
+        where u.role='student' and u.status='active'`,
+    );
+    return rows.map((r) => ({ id: r.id, role: 'student' as const }));
   }
 
   private async callOneSignal(args: {
@@ -461,3 +625,37 @@ export class NotificationsService {
     return ids.length === 0 ? null : ids.join(',');
   }
 }
+
+type TemplateRow = {
+  id: string;
+  name: string;
+  title: string;
+  message: string;
+  target_type: 'all_faculty' | 'selected_faculty' | 'admins' | 'all_students' | 'selected_students' | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
+export type TemplateJson = {
+  id: string;
+  name: string;
+  title: string;
+  message: string;
+  targetType: TemplateRow['target_type'];
+  createdAt: string;
+  updatedAt: string;
+};
+
+function mapTemplate(r: TemplateRow): TemplateJson {
+  return {
+    id: r.id,
+    name: r.name,
+    title: r.title,
+    message: r.message,
+    targetType: r.target_type,
+    createdAt: new Date(r.created_at).toISOString(),
+    updatedAt: new Date(r.updated_at).toISOString(),
+  };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
