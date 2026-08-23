@@ -1,6 +1,11 @@
 import { IsArray, IsEnum, IsNotEmpty, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 
-export type NotificationTarget = 'all_faculty' | 'selected_faculty' | 'admins';
+export type NotificationTarget =
+  | 'all_faculty'
+  | 'selected_faculty'
+  | 'admins'
+  | 'all_students'
+  | 'selected_students';
 
 export class SendNotificationDto {
   @IsString()
@@ -13,13 +18,18 @@ export class SendNotificationDto {
   @MaxLength(500)
   message!: string;
 
-  @IsEnum(['all_faculty', 'selected_faculty', 'admins'] as const)
+  @IsEnum(['all_faculty', 'selected_faculty', 'admins', 'all_students', 'selected_students'] as const)
   target_type!: NotificationTarget;
 
   @IsOptional()
   @IsArray()
   @IsUUID('4', { each: true })
   faculty_ids?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsUUID('4', { each: true })
+  student_ids?: string[];
 }
 
 export class UpdateSettingsDto {

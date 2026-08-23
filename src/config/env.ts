@@ -45,6 +45,13 @@ export const env = {
     restApiKey: process.env.ONESIGNAL_REST_API_KEY ?? '',
     apiUrl: (process.env.ONESIGNAL_API_URL ?? 'https://onesignal.com/api/v1').replace(/\/$/, ''),
   },
+  // Students subscribe from a different origin (westin-student.vercel.app). Browser
+  // same-origin policy forbids one OneSignal app serving two sites, so students get
+  // their own app; env var names match the operator's .env exactly.
+  onesignalStudents: {
+    appId: process.env.ONESIGNAL_APP_ID_Students ?? '53e2a6fc-6850-43f0-bb4f-aa60881a49e0',
+    restApiKey: process.env.ONESIGNAL_REST_API_KEY_Students ?? '',
+  },
 };
 
 function required(name: string): string {

@@ -4,21 +4,24 @@ import { env } from '../../config/env';
 
 /**
  * OneSignal Web Push — server-side only.
- * Site: https://westin-faculty.vercel.app (shared faculty+admin).
- * Student recipients are never included (blocked by role filter).
- * External IDs are faculty_<users.id> / admin_<users.id> via getOneSignalExternalId().
+ * Faculty/admin recipients subscribe on https://westin-faculty.vercel.app (main app);
+ * students on https://westin-student.vercel.app (separate app — same-origin policy).
+ * External IDs are faculty_<users.id> / admin_<users.id> / student_<users.id>
+ * via getOneSignalExternalId().
  */
 
-// Shared helper — must stay identical to faculty_admin_portal/src/lib/onesignal.ts:getOneSignalExternalId
-export function getOneSignalExternalId(user: { id: string; role: 'faculty' | 'admin' }): string {
+// Shared helper — must stay identical to faculty_admin_portal/src/lib/onesignal.ts
+// and Student_portal/src/lib/onesignal.ts getOneSignalExternalId
+export function getOneSignalExternalId(user: { id: string; role: 'faculty' | 'admin' | 'student' }): string {
   return `${user.role}_${user.id}`;
 }
 
 type SendInput = {
   title: string;
   message: string;
-  target_type: 'all_faculty' | 'selected_faculty' | 'admins';
+  target_type: 'all_faculty' | 'selected_faculty' | 'admins' | 'all_students' | 'selected_students';
   faculty_ids?: string[];
+  student_ids?: string[];
   senderAdminId: string;
 };
 
@@ -39,6 +42,24 @@ export class NotificationsService {
         order by coalesce(f.department,''), u.display_name`,
     );
     return rows.map((r: any) => ({ id: r.id, name: r.name, department: r.department }));
+  }
+
+  /** Lightweight active-student directory for the Send page checklist. Admin-only. */
+  async studentsList(): Promise<Array<{ id: string; name: string; studentId: string; department: string; year: string }>> {
+    const rows = await this.db.query<any>(
+      `select u.id, u.display_name as name, sp.student_id,
+              coalesce(sp.department,'—') as department, coalesce(sp.year::text,'—') as year
+         from users u join student_profiles sp on sp.user_id = u.id
+        where u.role='student' and u.status='active'
+        order by sp.student_id`,
+    );
+    return rows.map((r: any) => ({
+      id: r.id,
+      name: r.name,
+      studentId: r.student_id,
+      department: r.department,
+      year: r.year,
+    }));
   }
 
   // ---------- settings ----------
@@ -124,18 +145,60 @@ export class NotificationsService {
     const recipients = await this.db.query<any>(
       `select r.id, r.recipient_type as "recipientType", r.recipient_id as "recipientId",
               u.display_name as name, u.email,
-              coalesce(f.department, ap.title, '—') as department,
-              f.faculty_id as "facultyId", ap.admin_id as "adminId",
+              coalesce(f.department, sp.department, ap.title, '—') as department,
+              f.faculty_id as "facultyId", ap.admin_id as "adminId", sp.student_id as "studentId",
               r.delivered
          from notification_recipients r
          join users u on u.id=r.recipient_id
          left join faculty_profiles f on f.user_id=u.id
          left join admin_profiles ap on ap.user_id=u.id
-        where r.notification_id=$1
-        order by r.recipient_type, u.display_name`,
+         left join student_profiles sp on sp.user_id=u.id
+         where r.notification_id=$1
+         order by r.recipient_type, u.display_name`,
       [id],
     );
     return { ...notif, recipients, recipientCount: recipients.length };
+  }
+
+  // ---------- recipient inbox (in-app) ----------
+
+  /** Notifications addressed to the logged-in user (any role), newest first. */
+  async myNotifications(userId: string, limit = 30) {
+    const cap = Math.min(50, Math.max(1, Number(limit) || 30));
+    const items = await this.db.query<any>(
+      `select n.id, n.message_title as title, n.message_body as body,
+              n.created_at as "createdAt", r.read_at as "readAt"
+         from notification_recipients r
+         join notifications n on n.id = r.notification_id
+        where r.recipient_id = $1::uuid
+        order by n.created_at desc
+        limit $2`,
+      [userId, cap],
+    );
+    const unreadRow = await this.db.queryOne<{ c: string }>(
+      `select count(*)::text as c from notification_recipients where recipient_id = $1::uuid and read_at is null`,
+      [userId],
+    );
+    return { items, unread: Number(unreadRow?.c ?? 0) };
+  }
+
+  /** Mark one notification as read for this recipient. No-op if not addressed to them. */
+  async markRead(userId: string, notificationId: string) {
+    await this.db.query(
+      `update notification_recipients set read_at = coalesce(read_at, now())
+        where recipient_id = $1::uuid and notification_id = $2::uuid and read_at is null`,
+      [userId, notificationId],
+    );
+    return { ok: true };
+  }
+
+  async markAllRead(userId: string) {
+    await this.db.query(
+      `update notification_recipients set read_at = coalesce(read_at, now())
+        where recipient_id = $1::uuid and read_at is null`,
+      [userId],
+    );
+    return { ok: true };
   }
 
   // ---------- send ----------
@@ -149,7 +212,7 @@ export class NotificationsService {
     if (message.length > 500) throw new BadRequestException('Message must be 500 characters or fewer');
 
     // Resolve recipients server-side (never trust client counts)
-    let recipients: Array<{ id: string; role: 'faculty' | 'admin' }> = [];
+    let recipients: Array<{ id: string; role: 'faculty' | 'admin' | 'student' }> = [];
 
     if (input.target_type === 'all_faculty') {
       const rows = await this.db.query<{ id: string }>(
@@ -186,6 +249,28 @@ export class NotificationsService {
         throw new BadRequestException('No other active admins to notify (all opted out).');
       }
       recipients = rows.map((r) => ({ id: r.id, role: 'admin' as const }));
+    } else if (input.target_type === 'all_students') {
+      const rows = await this.db.query<{ id: string }>(
+        `select u.id from users u join student_profiles sp on sp.user_id = u.id
+          where u.role='student' and u.status='active'`,
+      );
+      recipients = rows.map((r) => ({ id: r.id, role: 'student' as const }));
+      if (recipients.length === 0) throw new BadRequestException('No active students found');
+    } else if (input.target_type === 'selected_students') {
+      const ids = [...new Set((input.student_ids ?? []).map((s) => s.trim()).filter(Boolean))];
+      if (ids.length === 0) throw new BadRequestException('Select at least one student');
+      // Validate all ids are active students
+      const rows = await this.db.query<{ id: string }>(
+        `select u.id from users u join student_profiles sp on sp.user_id = u.id
+          where u.id = any($1::uuid[]) and u.role='student' and u.status='active'`,
+        [ids],
+      );
+      if (rows.length !== ids.length) {
+        const found = new Set(rows.map((r) => r.id));
+        const missing = ids.filter((x) => !found.has(x));
+        throw new BadRequestException(`Unknown or inactive students: ${missing.join(', ')}`);
+      }
+      recipients = rows.map((r) => ({ id: r.id, role: 'student' as const }));
     } else {
       throw new BadRequestException('Invalid target_type');
     }
@@ -193,8 +278,12 @@ export class NotificationsService {
     // Build OneSignal external IDs (single shared helper)
     const externalIds = recipients.map((r) => getOneSignalExternalId(r));
 
+    // Students subscribe on their own origin → their own OneSignal app
+    const app: 'faculty' | 'student' =
+      input.target_type === 'all_students' || input.target_type === 'selected_students' ? 'student' : 'faculty';
+
     // Call OneSignal REST API (modular, never exposed to frontend)
-    const onesignalId = await this.callOneSignal({ title, message, externalIds });
+    const onesignalId = await this.callOneSignal({ title, message, externalIds, app });
 
     // Audit: one tx so notification + recipients are atomic
     const created = await this.db.tx(async (client) => {
@@ -234,93 +323,118 @@ export class NotificationsService {
     };
   }
 
-  private async callOneSignal(args: { title: string; message: string; externalIds: string[] }): Promise<string | null> {
-    const appId = env.onesignal.appId;
-    const restKey = env.onesignal.restApiKey;
+  private async callOneSignal(args: {
+    title: string;
+    message: string;
+    externalIds: string[];
+    app: 'faculty' | 'student';
+  }): Promise<string | null> {
+    // Faculty/admin recipients live in the faculty-portal app; students in the student app
+    // (separate origins → separate OneSignal apps, per browser same-origin policy).
+    const cfg =
+      args.app === 'student'
+        ? { appId: env.onesignalStudents.appId, restKey: env.onesignalStudents.restApiKey }
+        : { appId: env.onesignal.appId, restKey: env.onesignal.restApiKey };
     const apiUrl = env.onesignal.apiUrl;
 
     // Key not configured: local dev skips the remote call so the audit flow can still be
     // exercised without OneSignal. Production must fail loudly — a silent skip makes the
     // send look successful in the UI while nothing is ever delivered.
-    const keyMissing = !restKey || restKey.trim() === '' || restKey === 'REPLACE_WITH_REAL_REST_API_KEY';
+    const keyMissing = !cfg.restKey || cfg.restKey.trim() === '' || cfg.restKey === 'REPLACE_WITH_REAL_REST_API_KEY';
     if (keyMissing) {
       if (process.env.NODE_ENV === 'production') {
-        this.logger.error('ONESIGNAL_REST_API_KEY not configured in production — rejecting send');
+        this.logger.error(`ONESIGNAL REST key for the ${args.app} app not configured in production — rejecting send`);
         throw new ServiceUnavailableException(
-          'Push notifications are not configured on the server (missing OneSignal REST API key). Nothing was sent.',
+          `Push notifications are not configured on the server (missing OneSignal REST key for the ${args.app} app). Nothing was sent.`,
         );
       }
-      this.logger.warn('ONESIGNAL_REST_API_KEY not configured — skipping OneSignal REST call (audit still recorded).');
+      this.logger.warn(`ONESIGNAL REST key for the ${args.app} app not configured — skipping OneSignal REST call (audit still recorded).`);
       return null;
     }
 
-    // OneSignal rejects the ENTIRE send with `invalid_aliases` if any external_id maps to a
-    // subscription in an invalid state (e.g. a browser that blocked the permission prompt —
-    // notification_types -2, no token). The error lists the bad aliases, so drop them and
-    // retry with the valid subset: one poisoned recipient must not block everyone else.
-    let externalIds = args.externalIds;
-    for (let attempt = 0; ; attempt++) {
-      const body: Record<string, unknown> = {
-        app_id: appId,
-        include_aliases: { external_id: externalIds },
-        target_channel: 'push',
-        headings: { en: args.title },
-        contents: { en: args.message },
-      };
+    // OneSignal caps aliases per request — chunk large blasts (no-op at current scale).
+    const CHUNK = 2000;
+    const collected: (string | null)[] = [];
+    for (let base = 0; base < args.externalIds.length; base += CHUNK) {
+      let externalIds = args.externalIds.slice(base, base + CHUNK);
+      // OneSignal rejects the ENTIRE send with `invalid_aliases` if any external_id maps to a
+      // subscription in an invalid state (e.g. a browser that blocked the permission prompt —
+      // notification_types -2, no token). The error lists the bad aliases, so drop them and
+      // retry with the valid subset: one poisoned recipient must not block everyone else.
+      for (let attempt = 0; ; attempt++) {
+        const body: Record<string, unknown> = {
+          app_id: cfg.appId,
+          include_aliases: { external_id: externalIds },
+          target_channel: 'push',
+          headings: { en: args.title },
+          contents: { en: args.message },
+        };
 
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 8000);
-      let res: Response;
-      try {
-        res = await fetch(`${apiUrl}/notifications`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Key ${restKey}`,
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-      } catch (e: any) {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 8000);
+        let res: Response;
+        try {
+          res = await fetch(`${apiUrl}/notifications`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Key ${cfg.restKey}`,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } catch (e: any) {
+          clearTimeout(t);
+          if (e?.name === 'AbortError') throw new ServiceUnavailableException('OneSignal request timed out');
+          throw new ServiceUnavailableException(`OneSignal request failed: ${e?.message ?? String(e)}`);
+        }
         clearTimeout(t);
-        if (e?.name === 'AbortError') throw new ServiceUnavailableException('OneSignal request timed out');
-        throw new ServiceUnavailableException(`OneSignal request failed: ${e?.message ?? String(e)}`);
-      }
-      clearTimeout(t);
 
-      const text = await res.text();
-      let json: any = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        json = { raw: text };
-      }
+        const text = await res.text();
+        let json: any = null;
+        try {
+          json = text ? JSON.parse(text) : null;
+        } catch {
+          json = { raw: text };
+        }
 
-      const invalid: string[] = json?.errors?.invalid_aliases?.external_id ?? [];
-      if (!res.ok && invalid.length > 0 && externalIds.length > invalid.length && attempt < 3) {
-        this.logger.warn(
-          `OneSignal invalid_aliases (${invalid.length}) — retrying with ${externalIds.length - invalid.length}/${externalIds.length} external_ids`,
-        );
-        const bad = new Set<string>(invalid);
-        externalIds = externalIds.filter((id) => !bad.has(id));
-        continue;
-      }
+        const invalid: string[] = json?.errors?.invalid_aliases?.external_id ?? [];
+        // OneSignal sometimes reports a total no-op as HTTP 200 with an empty id and an
+        // errors array (e.g. "All included players are not subscribed" when nobody in the
+        // target list has subscribed yet). That is a failed send, not a success.
+        const softErrors: string[] = Array.isArray(json?.errors) ? json.errors : [];
+        if (res.ok && softErrors.length > 0 && !json?.id) {
+          this.logger.error(`OneSignal soft failure: ${JSON.stringify(json)}`);
+          throw new BadRequestException(`Push delivery failed: ${softErrors.join('; ').slice(0, 300)}`);
+        }
+        if (!res.ok && invalid.length > 0 && externalIds.length > invalid.length && attempt < 3) {
+          this.logger.warn(
+            `OneSignal invalid_aliases (${invalid.length}) — retrying with ${externalIds.length - invalid.length}/${externalIds.length} external_ids`,
+          );
+          const bad = new Set<string>(invalid);
+          externalIds = externalIds.filter((id) => !bad.has(id));
+          continue;
+        }
 
-      if (!res.ok) {
-        const msg =
-          invalid.length > 0
-            ? `All ${externalIds.length} recipients have invalid push subscriptions (permission blocked or never granted)`
-            : (json?.errors?.[0] ?? json?.error ?? json?.message ?? text ?? `OneSignal error ${res.status}`);
-        this.logger.error(`OneSignal send failed ${res.status}: ${JSON.stringify(json)}`);
-        // Surface as 400 so frontend shows actionable toast instead of 500
-        throw new BadRequestException(`Push delivery failed: ${String(msg).slice(0, 300)}`);
-      }
+        if (!res.ok) {
+          const msg =
+            invalid.length > 0
+              ? `All ${externalIds.length} recipients have invalid push subscriptions (permission blocked or never granted)`
+              : (json?.errors?.[0] ?? json?.error ?? json?.message ?? text ?? `OneSignal error ${res.status}`);
+          this.logger.error(`OneSignal send failed ${res.status}: ${JSON.stringify(json)}`);
+          // Surface as 400 so frontend shows actionable toast instead of 500
+          throw new BadRequestException(`Push delivery failed: ${String(msg).slice(0, 300)}`);
+        }
 
-      // Response shape: { id: "<onesignal-notification-id>", recipients: <int>, ... }
-      const nid: string | null = (json?.id as string) ?? (json?.notification_id as string) ?? null;
-      if (!nid) this.logger.warn(`OneSignal sent but no id in response: ${text.slice(0, 500)}`);
-      this.logger.log(`OneSignal sent id=${nid ?? 'n/a'} to ${externalIds.length} external_ids`);
-      return nid;
+        // Response shape: { id: "<onesignal-notification-id>", recipients: <int>, ... }
+        const nid: string | null = (json?.id as string) ?? (json?.notification_id as string) ?? null;
+        if (!nid) this.logger.warn(`OneSignal sent but no id in response: ${text.slice(0, 500)}`);
+        this.logger.log(`OneSignal sent id=${nid ?? 'n/a'} to ${externalIds.length} external_ids`);
+        collected.push(nid);
+        break;
+      }
     }
+    const ids = collected.filter((x): x is string => !!x);
+    return ids.length === 0 ? null : ids.join(',');
   }
 }

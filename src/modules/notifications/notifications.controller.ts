@@ -49,6 +49,12 @@ export class NotificationsController {
     return this.svc.facultyList();
   }
 
+  @Get('students/list')
+  @Roles('admin')
+  studentsList() {
+    return this.svc.studentsList();
+  }
+
   @Get('notifications/history')
   @Roles('admin')
   history(@Query() q: HistoryQueryDto) {
@@ -75,17 +81,37 @@ export class NotificationsController {
     return this.svc.putSettings(user.id, value);
   }
 
+  @Get('notifications/my')
+  @Roles('faculty', 'student', 'admin')
+  myNotifications(@CurrentUser() user: AuthUser, @Query('limit') limit?: string) {
+    return this.svc.myNotifications(user.id, Number(limit) || 30);
+  }
+
+  @Put('notifications/my/read-all')
+  @Roles('faculty', 'student', 'admin')
+  markAllRead(@CurrentUser() user: AuthUser) {
+    return this.svc.markAllRead(user.id);
+  }
+
+  @Put('notifications/my/:id/read')
+  @Roles('faculty', 'student', 'admin')
+  markRead(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: AuthUser) {
+    return this.svc.markRead(user.id, id);
+  }
+
   @Post('notifications/send')
   @Roles('admin')
   send(@CurrentUser() user: AuthUser, @Body() dto: SendNotificationDto) {
-    // normalize faculty_ids: accept both faculty_ids and facultyIds
+    // normalize ids: accept both snake_case and camelCase keys
     const raw: any = dto as any;
-    const ids: string[] | undefined = raw.faculty_ids ?? raw.facultyIds;
+    const facultyIds: string[] | undefined = raw.faculty_ids ?? raw.facultyIds;
+    const studentIds: string[] | undefined = raw.student_ids ?? raw.studentIds;
     return this.svc.send({
       title: raw.title ?? raw.message_title ?? '',
       message: raw.message ?? raw.message_body ?? '',
       target_type: raw.target_type ?? raw.targetType,
-      faculty_ids: ids,
+      faculty_ids: facultyIds,
+      student_ids: studentIds,
       senderAdminId: user.id,
     });
   }
