@@ -268,11 +268,24 @@ export class NotificationsService {
 
   /**
    * Courtesy push sent when a user subscribes for the FIRST time (frontend fires
-   * POST /notifications/thanks from OneSignal's PushSubscription change event when
-   * a brand-new subscription is created). Not recorded in admin History — it is a
-   * welcome, not a college notification.
+   * POST /notifications/thanks from the banner enable / subscription change event
+   * once the subscription is confirmed under the logged-in user's external id).
+   * Not recorded in admin History — it is a welcome, not a college notification.
+   *
+   * Exactly-once per user, DB-enforced: the client has several concurrent trigger
+   * paths and multiple tabs may race — only the first insert claims the row, every
+   * later call is a no-op. The claim is kept even if the push fails, so a flaky
+   * response can never cause a duplicate send.
    */
   async sendSubscriptionThanks(user: { id: string; role: 'faculty' | 'admin' | 'student' }) {
+    const claimed = await this.db.query<{ user_id: string }>(
+      `insert into notification_thanks (user_id) values ($1::uuid)
+       on conflict (user_id) do nothing
+       returning user_id`,
+      [user.id],
+    );
+    if (claimed.length === 0) return { sent: false };
+
     const app: 'faculty' | 'student' = user.role === 'student' ? 'student' : 'faculty';
     try {
       const nid = await this.callOneSignal({
@@ -456,7 +469,7 @@ export class NotificationsService {
       } catch (err) {
         if (
           err instanceof BadRequestException &&
-          /not subscribed|invalid push subscriptions/i.test(String(err.message))
+          /not subscribed|invalid push subscriptions|inactive/i.test(String(err.message))
         ) {
           this.logger.warn(
             `system push (${input.kind}) skipped on ${app} app — none of ${side.length} recipients subscribed`,
