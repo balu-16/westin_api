@@ -37,6 +37,10 @@ export class CreateEventDto {
   @IsOptional()
   @IsBoolean()
   isLive?: boolean;
+
+  @IsOptional()
+  @IsString()
+  posterPath?: string | null;
 }
 
 /** All fields optional; only provided fields are updated. */
@@ -73,4 +77,31 @@ export class UpdateEventDto {
   @IsOptional()
   @IsBoolean()
   isLive?: boolean;
+
+  @IsOptional()
+  @IsString()
+  posterPath?: string | null;
+}
+
+export class EventImageUploadUrlDto {
+  @IsString()
+  @IsNotEmpty()
+  name: string;
+
+  @IsOptional()
+  @IsString()
+  contentType?: string;
+
+  @IsOptional()
+  sizeBytes?: number;
+}
+
+export class CreateEventImageDto {
+  @IsString()
+  @IsNotEmpty()
+  storagePath: string;
+
+  @IsOptional()
+  @IsIn(['poster', 'gallery', 'reference'])
+  kind?: string;
 }

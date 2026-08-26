@@ -109,7 +109,11 @@ export class FacultyService {
     if (!section) throw new NotFoundException('Section not found');
     return this.db.query<any>(`
       select u.id, sp.student_id as "studentId", sp.roll_no as "rollNo",
-             u.display_name as name, u.email
+             u.display_name as name, u.email, u.status,
+             coalesce((
+               select round(100.0 * sum(case when r.status = 'present' then 1 else 0 end) / nullif(count(*),0))::int
+                 from attendance_records r where r.student_id = u.id
+             ), 0) as attendance
         from student_profiles sp join users u on u.id = sp.user_id
        where sp.section_id = $1
        order by sp.roll_no

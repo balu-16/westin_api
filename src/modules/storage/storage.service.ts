@@ -127,4 +127,5 @@ export const BUCKETS = {
   studyMaterials: 'study-materials',       // 50 MB limit
   reportAttachments: 'report-attachments', // 20 MB limit
   profileAvatars: 'profile-avatars',       // 5 MB limit
+  eventImages: 'event-images',             // 10 MB limit — posters + gallery / reference pics
 } as const;
