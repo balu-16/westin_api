@@ -235,7 +235,7 @@ export class EventsService {
     return { path, url };
   }
 
-  async listImages(eventId: string): Promise<EventImageJson[]> {
+  async listImages(eventId: string): Promise<{ images: EventImageJson[] }> {
     if (!UUID_RE.test(eventId)) throw new NotFoundException('Event not found');
     const exists = await this.db.queryOne(`select id from events where id = $1`, [eventId]);
     if (!exists) throw new NotFoundException('Event not found');
@@ -244,7 +244,7 @@ export class EventsService {
          from event_images where event_id = $1 order by created_at desc`,
       [eventId],
     );
-    return Promise.all(
+    const images = await Promise.all(
       rows.map(async (r) => {
         let url: string | null = null;
         try {
@@ -263,6 +263,7 @@ export class EventsService {
         };
       }),
     );
+    return { images };
   }
 
   async addImage(eventId: string, dto: { storagePath: string; kind?: string }, userId: string): Promise<EventImageJson> {
