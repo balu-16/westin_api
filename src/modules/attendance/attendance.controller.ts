@@ -47,4 +47,27 @@ export class AttendanceController {
   my(@CurrentUser() user: AuthUser, @Query('month') month?: string) {
     return this.attendance.myAttendance(user.id, month);
   }
+
+  @Get('day')
+  @Roles('student')
+  day(@CurrentUser() user: AuthUser, @Query('date') date: string) {
+    return this.attendance.dayDetail(user.id, date);
+  }
+
+  @Get('history')
+  @Roles('faculty')
+  history(
+    @CurrentUser() user: AuthUser,
+    @Query('sectionId') sectionId: string,
+    @Query('period') period: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.attendance.history(user.id, sectionId, period, limit ? Number(limit) : 30);
+  }
+
+  @Get('overview')
+  @Roles('admin')
+  overview() {
+    return this.attendance.adminOverview();
+  }
 }

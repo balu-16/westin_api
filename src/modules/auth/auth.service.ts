@@ -189,9 +189,22 @@ export class AuthService {
       [hash],
     );
     if (!row || row.revoked_at || new Date(row.expires_at).getTime() < Date.now()) {
+      // Reuse detection: a revoked/unknown refresh token presented again means
+      // the token family may be compromised — revoke all active sessions.
+      if (row?.revoked_at) {
+        await this.db.query(`update refresh_tokens set revoked_at = now() where user_id = $1 and revoked_at is null`, [row.user_id]).catch(() => undefined);
+      }
       throw new UnauthorizedException('Invalid refresh token');
     }
     await this.db.query(`update refresh_tokens set revoked_at = now() where id = $1`, [row.id]);
+    // Enforce max active sessions (rotation already revoked the presented one).
+    await this.db.query(
+      `update refresh_tokens set revoked_at = now()
+        where user_id = $1 and revoked_at is null and id not in (
+          select id from refresh_tokens where user_id = $1 and revoked_at is null order by created_at desc limit $2
+        )`,
+      [row.user_id, 2],
+    ).catch(() => undefined);
 
     const user = await this.db.queryOne<any>(
       `select u.*, f.faculty_id, f.designation, f.department,
@@ -265,7 +278,7 @@ export class AuthService {
     const accessToken = jwt.sign(
       { sub: user.id, role: user.role, name: user.display_name, email: user.email },
       env.jwtSecret,
-      { expiresIn: ACCESS_TTL },
+      { expiresIn: ACCESS_TTL, algorithm: 'HS256', issuer: env.jwtIssuer, audience: env.jwtAudience },
     );
     const refreshToken = randomToken();
     await this.db.query(

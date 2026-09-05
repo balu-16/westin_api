@@ -126,11 +126,16 @@ export class ReportsService {
   }
 
   /** Signed URL the client PUTs the attachment bytes to (report-attachments bucket). */
-  async uploadUrl(dto: { name: string; sizeBytes: number }) {
+  async uploadUrl(dto: { name: string; sizeBytes: number; contentType?: string }) {
+    if (!dto.name || dto.name.length > 160) throw new BadRequestException('name must be 1-160 characters');
     if (dto.sizeBytes > MAX_ATTACHMENT_BYTES) {
       throw new BadRequestException('Attachment exceeds the 20 MB report-attachments limit');
     }
-    const path = `${Date.now()}-${slugify(dto.name)}`;
+    if (dto.contentType && !/^(application\/pdf|application\/(vnd\.openxmlformats-officedocument|msword)|image\/)/.test(dto.contentType)) {
+      throw new BadRequestException('Only PDF, Office documents or images are allowed for reports');
+    }
+    const rand = Math.random().toString(36).slice(2, 8);
+    const path = `${Date.now()}-${rand}-${slugify(dto.name)}`;
     const { url } = await this.storage.signedUploadUrl(BUCKETS.reportAttachments, path);
     return { path, url };
   }

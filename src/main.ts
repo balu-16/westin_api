@@ -38,10 +38,13 @@ async function createServer() {
     new ValidationPipe({
       whitelist: true,
       transform: true,
+      forbidNonWhitelisted: false,
     }),
   );
   app.useGlobalFilters(new AllExceptionsFilter());
-  (app as any).getHttpAdapter().getInstance().set('trust proxy', true);
+  if (process.env.TRUST_PROXY === '1' || process.env.VERCEL === '1') {
+    (app as any).getHttpAdapter().getInstance().set('trust proxy', 1);
+  }
 
   await app.init();
   return app.getHttpAdapter().getInstance();

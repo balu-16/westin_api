@@ -203,6 +203,85 @@ export class AttendanceService {
     this.logger.log(`absent push → ${studentIds.length} students (${subject}, ${dto.date} P${periodNo})`);
   }
 
+  /** Per-day drill-down for the student calendar: which periods/subjects. */
+  async dayDetail(studentId: string, date: string) {
+    if (!DATE_RE.test(date)) throw new BadRequestException('date must be YYYY-MM-DD');
+    const rows = await this.db.query<any>(
+      `select s.period, r.status, sub.code, sub.name as subject,
+              to_char(s.session_date, 'YYYY-MM-DD') as date
+         from attendance_records r
+         join attendance_sessions s on s.id = r.session_id
+         left join subjects sub on sub.id = s.subject_id
+        where r.student_id = $1 and s.session_date = $2::date
+        order by s.period`,
+      [studentId, date],
+    );
+    return { date, periods: rows };
+  }
+
+  /** Faculty history: last N sessions for a section+period (read-only browse). */
+  async history(facultyId: string, sectionId: string, period: string, limit = 30) {
+    if (!isUuid(sectionId)) throw new BadRequestException('sectionId must be a UUID');
+    if (!VALID_PERIODS.has(period)) throw new BadRequestException('period must be one of h1..h6');
+    const n = Math.min(Math.max(Number(limit) || 30, 1), 90);
+    const assigned = await this.db.queryOne(
+      `select 1 from sections sec
+        where sec.id=$1 and (
+          sec.class_teacher_id=$2
+          or exists (select 1 from timetable_slots t where t.section_id=sec.id and t.faculty_id=$2)
+        )`,
+      [sectionId, facultyId],
+    );
+    if (!assigned) throw new NotFoundException('Section not found');
+    return this.db.query<any>(
+      `select s.id as "sessionId", to_char(s.session_date,'YYYY-MM-DD') as date, s.period,
+              sub.code as subject,
+              sum(case when r.status='present' then 1 else 0 end)::int as present,
+              sum(case when r.status='absent' then 1 else 0 end)::int as absent,
+              sum(case when r.status='leave' then 1 else 0 end)::int as "leave",
+              count(*)::int as total
+         from attendance_sessions s
+         left join attendance_records r on r.session_id = s.id
+         left join subjects sub on sub.id = s.subject_id
+        where s.section_id = $1 and s.period = $2
+        group by s.id, s.session_date, s.period, sub.code
+        order by s.session_date desc
+        limit $3`,
+      [sectionId, period, n],
+    );
+  }
+
+  /** Admin overview: section-wise attendance % + defaulters (<75%). */
+  async adminOverview() {
+    const sections = await this.db.query<any>(
+      `select sec.id, sec.label,
+              count(r.*)::int as total,
+              coalesce(sum(case when r.status='present' then 1 else 0 end),0)::int as present,
+              coalesce(round(100.0 * sum(case when r.status='present' then 1 else 0 end) / nullif(count(r.*),0)),0)::int as percentage
+         from sections sec
+         left join attendance_sessions s on s.section_id = sec.id
+         left join attendance_records r on r.session_id = s.id
+        group by sec.id, sec.label
+        order by sec.label`,
+    );
+    const defaulters = await this.db.query<any>(
+      `select u.display_name as name, sp.student_id as "studentId", sec.label as section,
+              count(*)::int as total,
+              sum(case when r.status='present' then 1 else 0 end)::int as present,
+              round(100.0 * sum(case when r.status='present' then 1 else 0 end) / nullif(count(*),0))::int as percentage
+         from attendance_records r
+         join student_profiles sp on sp.user_id = r.student_id
+         join users u on u.id = r.student_id
+         join attendance_sessions s on s.id = r.session_id
+         join sections sec on sec.id = s.section_id
+        group by u.display_name, sp.student_id, sec.label
+        having count(*) >= 3 and round(100.0 * sum(case when r.status='present' then 1 else 0 end) / nullif(count(*),0)) < 75
+        order by percentage asc
+        limit 100`,
+    );
+    return { sections, defaulters, required: 75 };
+  }
+
   /** Full student attendance page payload. */
   async myAttendance(studentId: string, month?: string) {
     const monthPattern = /^\d{4}-\d{2}$/;
@@ -212,9 +291,11 @@ export class AttendanceService {
     // Plain date parameters (sargable — no computed expressions on columns).
     const calStart = monthStart(target);                  // requested month, day 1
     const calEnd = monthEnd(target);                      // requested month, last day
-    const thisStart = monthStart(now.ym);                 // current Kolkata month
-    const nextStart = monthStart(monthShift(now.ym, 1));  // first day of next month
-    const lastStart = monthStart(now.lastYm);             // previous Kolkata month
+    const viewedStart = monthStart(target);               // viewed month (for "This Month" label)
+    const viewedNext = monthStart(monthShift(target, 1)); // viewed month end
+    const prevYm = monthShift(target, -1);
+    const prevStart = monthStart(prevYm);
+    const prevNext = monthStart(target);
 
     const [totals, subjects, calendar, quick] = await Promise.all([
       // Merged summary + overview: they used to be two identical full-history scans.
@@ -233,8 +314,8 @@ export class AttendanceService {
                round(100.0 * sum(case when r.status = 'present' then 1 else 0 end) / nullif(count(*), 0))::int as percentage
           from attendance_records r
           join attendance_sessions s on s.id = r.session_id
-          left join subjects sub on sub.id = s.subject_id
-         where r.student_id = $1
+          join subjects sub on sub.id = s.subject_id
+         where r.student_id = $1 and s.subject_id is not null
          group by sub.id, sub.code, sub.name
          order by sub.code
       `, [studentId]),
@@ -243,38 +324,42 @@ export class AttendanceService {
           select generate_series($2::date, $3::date, interval '1 day')::date as d
         )
         select to_char(days.d, 'YYYY-MM-DD') as date,
+               coalesce(cnt.total, 0)::int as classes,
                case
-                 when cnt.total = 0 then 'none'
+                 when coalesce(cnt.total, 0) = 0 then 'none'
                  when cnt.present = cnt.total then 'present'
-                 when cnt.present = 0 then 'absent'
+                 when cnt.leaveonly = cnt.total then 'leave'
+                 when cnt.present = 0 and cnt.leaveonly = 0 then 'absent'
                  else 'mixed'
                end as status
           from days
           left join (
             select s.session_date,
                    count(*) as total,
-                   sum(case when r.status = 'present' then 1 else 0 end) as present
+                   sum(case when r.status = 'present' then 1 else 0 end) as present,
+                   sum(case when r.status = 'leave' then 1 else 0 end) as leaveonly
               from attendance_records r
               join attendance_sessions s on s.id = r.session_id
              where r.student_id = $1
                and s.session_date between $2::date and $3::date
              group by s.session_date
           ) cnt on cnt.session_date = days.d
+         order by days.d
       `, [studentId, calStart, calEnd]),
       this.db.queryOne<any>(`
         select
           coalesce(round(100.0 * (sum(case when r.status = 'present' then 1 else 0 end)
                filter (where s.session_date >= $2::date and s.session_date < $3::date))
-               / nullif(count(*) filter (where s.session_date >= $2::date and s.session_date < $3::date), 0)), 0)::int as "thisMonth",
+               / nullif(count(*) filter (where s.session_date >= $2::date and s.session_date < $3::date), 0)), 0)::int as "viewedMonth",
           coalesce(round(100.0 * (sum(case when r.status = 'present' then 1 else 0 end)
-               filter (where s.session_date >= $4::date and s.session_date < $2::date))
-               / nullif(count(*) filter (where s.session_date >= $4::date and s.session_date < $2::date), 0)), 0)::int as "lastMonth",
+               filter (where s.session_date >= $4::date and s.session_date < $5::date))
+               / nullif(count(*) filter (where s.session_date >= $4::date and s.session_date < $5::date), 0)), 0)::int as "prevMonth",
           coalesce(round(100.0 * sum(case when r.status = 'present' then 1 else 0 end)
-               / nullif(count(*), 0)), 0)::int as "semesterAvg"
+               / nullif(count(*), 0)), 0)::int as "overallAvg"
         from attendance_records r
         join attendance_sessions s on s.id = r.session_id
        where r.student_id = $1
-      `, [studentId, thisStart, nextStart, lastStart]),
+      `, [studentId, viewedStart, viewedNext, prevStart, prevNext]),
     ]);
 
     const total = totals?.total ?? 0;
@@ -293,11 +378,15 @@ export class AttendanceService {
         { label: 'Absent', value: totals?.absent ?? 0 },
         { label: 'Leave', value: totals?.leave ?? 0 },
       ],
-      calendar: calendar.map((c: any) => ({ date: c.date, status: c.status ?? 'none' })),
+      calendar: calendar.map((c: any) => ({ date: c.date, status: c.status ?? 'none', classes: Number(c.classes ?? 0) })),
       quickStats: {
-        thisMonth: quick?.thisMonth ?? 0,
-        lastMonth: quick?.lastMonth ?? 0,
-        semesterAvg: quick?.semesterAvg ?? 0,
+        viewedMonth: quick?.viewedMonth ?? 0,
+        prevMonth: quick?.prevMonth ?? 0,
+        overallAvg: quick?.overallAvg ?? 0,
+        // Back-compat aliases for older frontends:
+        thisMonth: quick?.viewedMonth ?? 0,
+        lastMonth: quick?.prevMonth ?? 0,
+        semesterAvg: quick?.overallAvg ?? 0,
         required: 75,
       },
     };

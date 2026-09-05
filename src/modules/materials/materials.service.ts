@@ -154,12 +154,18 @@ export class MaterialsService {
     };
   }
 
+  private static readonly ALLOWED_TYPES = new Set(['pdf', 'docx', 'pptx', 'xlsx']);
   /** Signed URL the client PUTs the file bytes to (study-materials bucket). */
-  async uploadUrl(dto: { name: string; sizeBytes: number }) {
+  async uploadUrl(dto: { name: string; sizeBytes: number; contentType?: string; fileType?: string }) {
+    if (!dto.name || dto.name.length > 160) throw new BadRequestException('name must be 1-160 characters');
     if (dto.sizeBytes > MAX_FILE_BYTES) {
       throw new BadRequestException('File exceeds the 50 MB study-materials limit');
     }
-    const path = `${Date.now()}-${slugify(dto.name)}`;
+    if (dto.fileType && !MaterialsService.ALLOWED_TYPES.has(String(dto.fileType).toLowerCase())) {
+      throw new BadRequestException('fileType must be pdf, docx, pptx or xlsx');
+    }
+    const rand = Math.random().toString(36).slice(2, 8);
+    const path = `${Date.now()}-${rand}-${slugify(dto.name)}`;
     const { url } = await this.storage.signedUploadUrl(BUCKETS.studyMaterials, path);
     return { path, url };
   }
@@ -167,6 +173,13 @@ export class MaterialsService {
   async create(dto: CreateMaterialDto, userId: string): Promise<MaterialFileJson> {
     if (dto.sizeBytes > MAX_FILE_BYTES) {
       throw new BadRequestException('File exceeds the 50 MB study-materials limit');
+    }
+    // Verify the object actually landed in storage so stats/download URLs never poison.
+    try {
+      const head = await this.storage.headObject(BUCKETS.studyMaterials, dto.storagePath);
+      if (!head.exists) throw new BadRequestException('Uploaded object not found — re-upload the file');
+    } catch (e) {
+      if (e instanceof BadRequestException) throw e;
     }
     await this.assertSubjectExists(dto.subjectId ?? null);
     const row = await this.db.queryOne<FileRow>(

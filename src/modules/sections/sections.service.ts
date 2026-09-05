@@ -36,7 +36,7 @@ export class SectionsService {
   }
 
   async create(dto: { label: string; department: string; year: number; classTeacherId?: string; maxStrength?: number }) {
-    const dup = await this.db.queryOne(`select 1 from sections where label = $1`, [dto.label]);
+    const dup = await this.db.queryOne(`select 1 from sections where lower(label) = lower($1)`, [dto.label.trim()]);
     if (dup) throw new ConflictException(`Section ${dto.label} already exists`);
     const row = await this.db.queryOne<any>(`
       insert into sections (label, department, year, class_teacher_id, max_strength)
@@ -49,6 +49,10 @@ export class SectionsService {
 
   async update(id: string, dto: Partial<{ label: string; department: string; year: number; classTeacherId: string | null; maxStrength: number }>) {
     await this.findOne(id);
+    if (dto.label !== undefined) {
+      const dup = await this.db.queryOne(`select 1 from sections where lower(label) = lower($1) and id <> $2`, [String(dto.label).trim(), id]);
+      if (dup) throw new ConflictException(`Section ${dto.label} already exists`);
+    }
     const sets: string[] = [];
     const params: unknown[] = [];
     const map: Record<string, string> = {
@@ -71,11 +75,18 @@ export class SectionsService {
 
   async remove(id: string) {
     await this.findOne(id);
-    const students = await this.db.queryOne<{ count: number }>(
-      `select count(*)::int as count from student_profiles where section_id = $1`, [id],
+    const refs = await this.db.queryOne<{ students: number; slots: number; sessions: number; reports: number }>(
+      `select (select count(*) from student_profiles where section_id = $1)::int as students,
+              (select count(*) from timetable_slots where section_id = $1)::int as slots,
+              (select count(*) from attendance_sessions where section_id = $1)::int as sessions,
+              (select count(*) from daily_reports where section_id = $1)::int as reports`,
+      [id],
     );
-    if (students && students.count > 0) {
-      throw new ConflictException(`Section still has ${students.count} students — move them first`);
+    if (refs && refs.students > 0) {
+      throw new ConflictException(`Section still has ${refs.students} students — move them first`);
+    }
+    if (refs && (refs.slots > 0 || refs.sessions > 0 || refs.reports > 0)) {
+      throw new ConflictException(`Section still has timetable/attendance/report history — delete those first`);
     }
     await this.db.query(`delete from sections where id = $1`, [id]);
     this.cache.invalidate('sections');
@@ -83,34 +94,31 @@ export class SectionsService {
   }
 
   async moveStudent(sectionId: string, studentId: string) {
-    await this.findOne(sectionId);
-    const student = await this.db.queryOne<any>(`
-      select sp.user_id, sp.roll_no, sec.label as prefix
-        from student_profiles sp
-        left join sections sec on sec.id = sp.section_id
-       where sp.user_id = $1
-    `, [studentId]);
-    if (!student) throw new NotFoundException('Student not found');
-
-    const section = await this.db.queryOne<{ label: string; max_strength: number; count: number }>(`
-      select s.label, s.max_strength,
-             (select count(*)::int from student_profiles sp where sp.section_id = s.id) as count
-        from sections s where s.id = $1
-    `, [sectionId]);
-    if (section && section.count >= section.max_strength) {
-      throw new BadRequestException(`Section ${section.label} is at max strength ${section.max_strength}`);
-    }
-
-    // Roll number = next sequence in target section (label digits or fallback count).
-    const prefix = section?.label?.replace(/-\d+$/, '') ?? 'S';
-    const next = (section?.count ?? 0) + 1;
-    const rollNo = `${prefix}-${String(next).padStart(2, '0')}`;
-    await this.db.query(
-      `update student_profiles set section_id = $1, roll_no = $2 where user_id = $3`,
-      [sectionId, rollNo, studentId],
-    );
+    const result = await this.db.tx(async (client) => {
+      const sec = await client.query(`select id, label, max_strength from sections where id = $1 for update`, [sectionId]);
+      if (sec.rows.length === 0) throw new NotFoundException('Section not found');
+      const student = await client.query(`select user_id from student_profiles where user_id = $1`, [studentId]);
+      if (student.rows.length === 0) throw new NotFoundException('Student not found');
+      const cnt = await client.query(`select count(*)::int as count from student_profiles where section_id = $1`, [sectionId]);
+      const count = cnt.rows[0]?.count ?? 0;
+      const max = sec.rows[0].max_strength ?? 40;
+      if (count >= max) throw new BadRequestException(`Section ${sec.rows[0].label} is at max strength ${max}`);
+      // Roll number unique per section: retry on collision (concurrent moves).
+      const prefix = String(sec.rows[0].label ?? 'S').replace(/-\d+$/, '');
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const c = await client.query(`select count(*)::int as count from student_profiles where section_id = $1`, [sectionId]);
+        const next = (c.rows[0]?.count ?? 0) + 1 + attempt;
+        const rollNo = `${prefix}-${String(next).padStart(2, '0')}`;
+        const clash = await client.query(`select 1 from student_profiles where section_id = $1 and roll_no = $2`, [sectionId, rollNo]);
+        if (clash.rows.length === 0) {
+          await client.query(`update student_profiles set section_id = $1, roll_no = $2 where user_id = $3`, [sectionId, rollNo, studentId]);
+          return { studentId, sectionId, rollNo };
+        }
+      }
+      throw new ConflictException('Could not assign a unique roll number — retry');
+    });
     this.cache.invalidate('sections');
     this.cache.invalidate('students');
-    return { studentId, sectionId, rollNo };
+    return result;
   }
 }

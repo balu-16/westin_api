@@ -73,10 +73,10 @@ export class EventsService {
   ) {}
 
   /** Aggregated payload for the events page (any authenticated role).
-   *  Rows are cached (identical for every user); the date-relative parts
-   *  (upcoming/featured/marks) are recomputed per request so the payload
-   *  rolls over correctly at midnight. */
-  async list() {
+   *  Supports ?search&category&from&to&includePast so calendars can filter
+   *  by day and browse history. Rows cached; date-relative parts recomputed
+   *  per request so the payload rolls over correctly at midnight. */
+  async list(query?: { search?: string; category?: string; from?: string; to?: string; includePast?: string | boolean }) {
     const rows = await this.cache.wrap<EventRow[]>('events:all', 60_000, () =>
       this.db.query<EventRow>(
         `select id, title, category,
@@ -88,15 +88,36 @@ export class EventsService {
       ),
     );
     const today = kolkataNow().today;
+    const includePast = query?.includePast === true || query?.includePast === 'true' || query?.includePast === '1';
+    const search = (query?.search ?? '').trim().toLowerCase();
+    const category = (query?.category ?? '').trim();
+    const from = query?.from ?? '';
+    const to = query?.to ?? '';
 
-    const upcomingRows = rows.filter((r) => r.start_date >= today);
+    let filtered = rows;
+    if (!includePast) {
+      // Keep history reachable: only hide rows that fully ended before today.
+      filtered = filtered.filter((r) => (r.end_date ?? r.start_date) >= today);
+    }
+    if (category) filtered = filtered.filter((r) => r.category === category);
+    if (from) filtered = filtered.filter((r) => (r.end_date ?? r.start_date) >= from);
+    if (to) filtered = filtered.filter((r) => r.start_date <= to);
+    if (search) {
+      filtered = filtered.filter((r) =>
+        `${r.title} ${r.description ?? ''} ${r.location ?? ''}`.toLowerCase().includes(search),
+      );
+    }
+
+    const upcomingRows = filtered.filter((r) => (r.end_date ?? r.start_date) >= today);
+    const pastRows = filtered.filter((r) => (r.end_date ?? r.start_date) < today).sort((a, b) => b.start_date.localeCompare(a.start_date));
     // Featured: a live event wins; otherwise the soonest upcoming; null if neither exists.
     const featuredRow = rows.find((r) => r.is_live) ?? upcomingRows[0] ?? null;
 
-    // Calendar marks: every day covered by the featured + upcoming events.
+    // Calendar marks: every day covered by ALL filtered rows (not just upcoming)
+    // so history dots render when includePast is set.
     const marks = new Set<string>();
     if (featuredRow) addRange(marks, featuredRow.start_date, featuredRow.end_date);
-    for (const r of upcomingRows) addRange(marks, r.start_date, r.end_date);
+    for (const r of filtered) addRange(marks, r.start_date, r.end_date);
 
     const counts = new Map<string, number>();
     for (const r of rows) counts.set(r.category, (counts.get(r.category) ?? 0) + 1);
@@ -104,14 +125,16 @@ export class EventsService {
       .map(([category, count]) => ({ category, count }))
       .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
 
-    const [featured, upcoming] = await Promise.all([
+    const [featured, upcoming, past] = await Promise.all([
       featuredRow ? this.mapEvent(featuredRow) : Promise.resolve(null),
       Promise.all(upcomingRows.map((r) => this.mapEvent(r))),
+      Promise.all(pastRows.map((r) => this.mapEvent(r))),
     ]);
 
     return {
       featured,
       upcoming,
+      past,
       calendarMarks: [...marks].sort(),
       categories,
     };
@@ -151,8 +174,18 @@ export class EventsService {
     return this.mapEvent(row!);
   }
 
-  async update(id: string, dto: UpdateEventDto): Promise<EventJson> {
+  /** Only the creator or an admin may mutate an event — prevents any
+   *  faculty from editing/deleting another faculty's events/gallery. */
+  private assertCanMutate(row: EventRow, userId: string, userRole: string) {
+    if (userRole === 'admin') return;
+    if (row.created_by && row.created_by !== userId) {
+      throw new NotFoundException('Event not found');
+    }
+  }
+
+  async update(id: string, dto: UpdateEventDto, user?: { id: string; role: string }): Promise<EventJson> {
     const existing = await this.findOneRow(id);
+    if (user) this.assertCanMutate(existing, user.id, user.role);
 
     const startDate =
       dto.startDate !== undefined ? parseDate(dto.startDate, 'startDate') : existing.start_date;
@@ -202,8 +235,9 @@ export class EventsService {
     return this.mapEvent(row!);
   }
 
-  async remove(id: string) {
+  async remove(id: string, user?: { id: string; role: string }) {
     const row = await this.findOneRow(id);
+    if (user) this.assertCanMutate(row, user.id, user.role);
     // Delete gallery images from storage first (best-effort)
     const images = await this.db.query<{ storage_path: string }>(
       `select storage_path from event_images where event_id = $1`,
@@ -224,13 +258,15 @@ export class EventsService {
   // ---------- poster / gallery image helpers ----------
 
   async eventImageUploadUrl(dto: { name: string; contentType?: string; sizeBytes?: number }) {
+    if (!dto.name || dto.name.length > 120) throw new BadRequestException('name must be 1-120 characters');
     if (dto.sizeBytes && dto.sizeBytes > MAX_IMAGE_BYTES) {
       throw new BadRequestException('Image exceeds the 10 MB event-images limit');
     }
     if (dto.contentType && !dto.contentType.startsWith('image/')) {
       throw new BadRequestException('Only image/* uploads are allowed for events');
     }
-    const path = `${Date.now()}-${slugify(dto.name)}`;
+    const rand = Math.random().toString(36).slice(2, 8);
+    const path = `${Date.now()}-${rand}-${slugify(dto.name)}`;
     const { url } = await this.storage.signedUploadUrl(BUCKETS.eventImages, path);
     return { path, url };
   }
@@ -266,10 +302,13 @@ export class EventsService {
     return { images };
   }
 
-  async addImage(eventId: string, dto: { storagePath: string; kind?: string }, userId: string): Promise<EventImageJson> {
+  async addImage(eventId: string, dto: { storagePath: string; kind?: string }, userId: string, userRole = 'faculty'): Promise<EventImageJson> {
     if (!UUID_RE.test(eventId)) throw new NotFoundException('Event not found');
-    const exists = await this.db.queryOne(`select id from events where id = $1`, [eventId]);
+    const exists = await this.db.queryOne<EventRow>(`select id, created_by from events where id = $1`, [eventId]);
     if (!exists) throw new NotFoundException('Event not found');
+    if (userRole !== 'admin' && (exists as any).created_by && (exists as any).created_by !== userId) {
+      throw new NotFoundException('Event not found');
+    }
     if (!dto.storagePath || dto.storagePath.length > 500) throw new BadRequestException('storagePath required');
     const kind = dto.kind && ['poster', 'gallery', 'reference'].includes(dto.kind) ? dto.kind : 'gallery';
     // Best-effort: verify object exists (HEAD), but don't fail if storage is eventually consistent
@@ -300,13 +339,17 @@ export class EventsService {
     };
   }
 
-  async removeImage(imageId: string) {
+  async removeImage(imageId: string, user?: { id: string; role: string }) {
     if (!UUID_RE.test(imageId)) throw new NotFoundException('Image not found');
-    const row = await this.db.queryOne<EventImageRow>(
-      `select id, event_id, storage_path from event_images where id = $1`,
+    const row = await this.db.queryOne<EventImageRow & { created_by?: string }>(
+      `select i.id, i.event_id, i.storage_path, e.created_by
+         from event_images i join events e on e.id = i.event_id where i.id = $1`,
       [imageId],
     );
     if (!row) throw new NotFoundException('Image not found');
+    if (user && user.role !== 'admin' && (row as any).created_by && (row as any).created_by !== user.id) {
+      throw new NotFoundException('Image not found');
+    }
     await this.db.query(`delete from event_images where id = $1`, [imageId]);
     this.storage.deleteObject(BUCKETS.eventImages, row.storage_path).catch((e) => this.logger.warn(`delete event image ${row.storage_path} failed: ${(e as Error).message}`));
     return { deleted: true };
